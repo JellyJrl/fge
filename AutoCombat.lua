@@ -25,7 +25,8 @@
                  While fighting one group, the bot stays out of the aggro range of the others.
 
     One file, a few module tables:
-      Npcs  Dungeon  Hazards  Walls  Planner  Nav  Skills  ESP  UI  Bot
+      Npcs  Dungeon  Hazards  Walls  Planner  Nav  Noclip  Skills  ESP  UI  Bot
+    Noclip (the switch in the window, or the N key) lets the character walk through the map's walls, with or without the bot.
     Running the script again stops the previous run. The running bot is reachable as getgenv().__AutoCombat;
     getgenv().__AutoCombat.api.Bot.dump() prints a report of everything it sees (also the button in the window).
 ]]
@@ -58,11 +59,14 @@ local Config = {
     -- ---- fighting distances (studs) ----
     MIN_DISTANCE        = 7,     -- never closer than this to an npc's body
     ATTACK_RANGE        = 90,    -- how far the attack skill is assumed to reach (to an npc's CENTRE); calibrated while fighting
+    NOCLIP              = false, -- start with noclip on (the Noclip switch / key: walk through the map's walls; the bot uses it too)
+    NOCLIP_KEY          = "N",   -- the key that toggles it ("" = no key)
     KEEP_MOVING         = true,  -- never stand still in a fight: circle the target (see Bot.strafeStep). Also the Move switch
     STRAFE_LENGTH       = 14,    -- studs of each straight lane
     STRAFE_HOLD         = 1.0,   -- the far end of a lane must stay clear this long after we get there
     STRAFE_RATE         = 0.12,  -- choose the lane again this often
     STRAFE_BAND         = 7,     -- stay within this many studs of the stand ring (less than BACKOFF, so it never triggers a reposition)
+    STRAFE_MIN_BAND     = 6,     -- the band is never narrower than this (a huge body and a short reach leave little room to circle)
     STRAFE_KEEP         = 1.0,   -- how much a lane that carries on the way we are running is preferred
     STRAFE_FLIP_MIN     = 7,     -- circle one way round for this long at least (a turn-round costs momentum)...
     STRAFE_FLIP_MAX     = 14,    -- ...and at most, then reverse
@@ -218,7 +222,7 @@ local Config = {
 -- =====================
 -- SHARED: modules, state, helpers
 -- =====================
-local Npcs, Dungeon, Hazards, Walls, Planner, Nav, Skills, ESP, UI, Bot = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+local Npcs, Dungeon, Hazards, Walls, Planner, Nav, Noclip, Skills, ESP, UI, Bot = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
 local API = {}   -- filled in at the bottom: the modules, reachable as getgenv().__AutoCombat.api
 
 local State = {
@@ -227,6 +231,7 @@ local State = {
     esp = Config.ESP,
     aim = Config.AUTO_AIM,
     moveOn = Config.KEEP_MOVING,   -- the Move switch
+    noclip = Config.NOCLIP,        -- the Noclip switch: the character passes through walls
     mode = "IDLE",
     char = nil, hum = nil, hrp = nil,
     wasAlive = true,
@@ -1807,8 +1812,10 @@ function Walls.floorBelow(pos)
     return Walls.cast(pos + Vector3.new(0, 2, 0), Vector3.new(0, -14, 0)) ~= nil
 end
 
--- body-wide sweep from a to b (6 rays, plus a margin past b) + a floor check under b
+-- body-wide sweep from a to b (6 rays, plus a margin past b) + a floor check under b. (With noclip there is no wall in the way,
+-- but there must still be ground to stand on.)
 function Walls.moveClear(a, b)
+    if State.noclip then return Walls.floorBelow(b) end
     local dir = b - a
     local flatDir = flat(dir)
     if flatDir.Magnitude < 0.01 then return true end
@@ -1829,8 +1836,15 @@ end
 -- the cheap test the planner makes for every step between neighbouring cells: one ray along the step at body height, and
 -- floor under the end
 function Walls.stepClear(a, b)
-    if Walls.cast(a + Vector3.new(0, 1, 0), b - a) then return false end
+    if not State.noclip and Walls.cast(a + Vector3.new(0, 1, 0), b - a) then return false end
     return Walls.floorBelow(b)
+end
+
+-- how far we can run from `origin` along `dir` before a wall, up to `length` (all of it with noclip)
+function Walls.runLength(origin, dir, length)
+    if State.noclip then return length end
+    local hit = Walls.cast(origin, dir * length)
+    return hit and hit.Distance or length
 end
 -- =====================
 -- PLANNER: where to be, and how to get there without being hit
@@ -2363,6 +2377,20 @@ end
 
 -- Returns true when a path was started (or the situation changed while it computed, so there is nothing to do).
 function Nav.pathTo(pos)
+    -- noclip: walls are no obstacle, so walk straight there (as long as there is ground the whole way)
+    if State.noclip and Noclip.groundBetween(State.hrp.Position, pos) then
+        local from = State.hrp.Position
+        local waypoints = { { Position = from, Action = Enum.PathWaypointAction.Walk } }
+        local n = math.max(1, math.ceil(flat(pos - from).Magnitude / 12))   -- (each one reached within the waypoint timeout)
+        for i = 1, n do
+            table.insert(waypoints, { Position = from + (pos - from) * (i / n), Action = Enum.PathWaypointAction.Walk })
+        end
+        Nav.pathGoal = pos
+        ESP.drawPath(waypoints)
+        Nav.walk(waypoints)
+        return true
+    end
+
     local path = PathfindingService:CreatePath({ AgentHeight = 5, AgentRadius = 2, AgentCanJump = true, AgentCanClimb = false })
     local ok = pcall(function() path:ComputeAsync(State.hrp.Position, pos) end)
 
@@ -2446,6 +2474,102 @@ function Nav.ringPoints(group, barrier)
     local out = {}
     for i, p in ipairs(pts) do out[i] = p.pos end
     return out, usedR
+end
+
+-- =====================
+-- NOCLIP: walk through the map's walls
+-- The character's parts are made non-colliding on every physics step (the Humanoid turns collisions back on each step, so it has
+-- to be done every time, before the physics runs: RunService.Stepped). The Humanoid keeps standing by looking for the ground with
+-- a ray, not by collision, so the character passes through walls but still stands on floors - and still falls off ledges.
+-- While it is on, the bot's own wall checks step aside (Walls) and it walks straight to where it is going (Nav.pathTo), but never
+-- where there is no ground. The switch is in the window, and on the Config.NOCLIP_KEY key.
+-- =====================
+Noclip.parts = setmetatable({}, { __mode = "k" })     -- the character's parts
+Noclip.changed = setmetatable({}, { __mode = "k" })   -- the parts we turned non-solid: what restore() gives back (and nothing else)
+Noclip.char = nil
+Noclip.added = nil
+
+local function off(part)
+    if part.CanCollide then
+        part.CanCollide = false
+        Noclip.changed[part] = true
+    end
+end
+
+-- every physics step: collisions off for every part of the character (including a tool's handle the moment it is equipped)
+function Noclip.step()
+    local char = player.Character
+    if not char then return end
+    if char ~= Noclip.char then   -- a new character (a respawn): its parts, not the old ones
+        Noclip.char = char
+        Noclip.parts = setmetatable({}, { __mode = "k" })
+        Noclip.changed = setmetatable({}, { __mode = "k" })
+        if Noclip.added then pcall(function() Noclip.added:Disconnect() end) end
+        for _, d in ipairs(char:GetDescendants()) do
+            if d:IsA("BasePart") then Noclip.parts[d] = true end
+        end
+        Noclip.added = track(char.DescendantAdded:Connect(function(d)
+            if d:IsA("BasePart") then
+                Noclip.parts[d] = true
+                if State.noclip then off(d) end
+            end
+        end))
+    end
+    if not State.noclip then return end
+    for part in pairs(Noclip.parts) do
+        if part.Parent then off(part) end
+    end
+end
+
+-- collisions back on for what we turned off (the Humanoid does this itself every step once we stop; this just makes it immediate,
+-- and leaves alone any part the game itself made non-solid)
+function Noclip.restore()
+    for part in pairs(Noclip.changed) do
+        if part.Parent then part.CanCollide = true end
+    end
+    Noclip.changed = setmetatable({}, { __mode = "k" })
+end
+
+function Noclip.set(on)
+    if State.noclip == on then return end
+    State.noclip = on
+    Planner.edges, Planner.edgeCount = {}, 0   -- "can I step from here to there" was worked out with the walls in or out of the way
+    table.clear(Bot.barriers)                  -- (and so was "a wall stops me getting any closer": look again)
+    if on then
+        Noclip.step()
+    else
+        Noclip.restore()
+    end
+    Log.add(on and "Noclip on - walking through walls" or "Noclip off")
+    if UI.restyle then UI.restyle() end
+end
+
+function Noclip.toggle()
+    Noclip.set(not State.noclip)
+end
+
+function Noclip.start()
+    track(RunService.Stepped:Connect(function()
+        local ok, err = pcall(Noclip.step)
+        if not ok then Bot.reportError("noclip", err) end
+    end))
+    local ok, key = pcall(function() return Config.NOCLIP_KEY ~= "" and Enum.KeyCode[Config.NOCLIP_KEY] or nil end)   -- (a typo in the config is no reason to fail)
+    if ok and key then
+        track(UserInputService.InputBegan:Connect(function(input, processed)
+            if not processed and input.KeyCode == key then Noclip.toggle() end
+        end))
+    end
+end
+
+-- ground the whole way from `from` to `to`? (walking straight across a gap would be a fall). Looked at every 3 studs (no gap a
+-- character could drop into is narrower), and at most 120 times however far it is.
+function Noclip.groundBetween(from, to)
+    local span = flat(to - from).Magnitude
+    local n = math.clamp(math.ceil(span / 3), 1, 120)
+    for i = 1, n do
+        if not Walls.floorBelow(from + (to - from) * (i / n)) then return false end
+    end
+    return true
 end
 
 -- =====================
@@ -3710,8 +3834,8 @@ function UI.build()
     switches.LayoutOrder = nextOrder(body)
     switches.Parent = body
     layout(switches, 6, true)
-    local third = UDim2.new(1 / 3, -4, 1, 0)
-    local styleBot, styleEsp, styleAim, styleMove
+    local third, half = UDim2.new(1 / 3, -4, 1, 0), UDim2.new(1 / 2, -3, 1, 0)
+    local styleBot, styleEsp, styleAim, styleMove, styleNoclip
     styleBot = toggle(switches, third, function()
         State.enabled = not State.enabled
         Nav.setControls(not State.enabled)   -- bot on -> it takes the controls; off -> they come back
@@ -3728,30 +3852,34 @@ function UI.build()
         UI.restyle()
     end)
 
-    -- second row: keep moving, the report, and forgetting what it learned
+    -- second row: keep moving, noclip
     local switches2 = Instance.new("Frame")
     switches2.Size = UDim2.new(1, 0, 0, 30)
     switches2.BackgroundTransparency = 1
     switches2.LayoutOrder = nextOrder(body)
     switches2.Parent = body
     layout(switches2, 6, true)
-    styleMove = toggle(switches2, third, function()
+    styleMove = toggle(switches2, half, function()
         State.moveOn = not State.moveOn
         if not State.moveOn then Nav.stop() end
         Log.add(State.moveOn and "Keep moving on" or "Keep moving off (stands still in a fight)")
         UI.restyle()
+    end)
+    styleNoclip = toggle(switches2, half, function()
+        Noclip.toggle()   -- (restyles the window itself)
     end)
     UI.restyle = function()
         styleBot("Bot", State.enabled)
         styleEsp("ESP", State.esp)
         styleAim("Aim", State.aim)
         styleMove("Move", State.moveOn)
+        styleNoclip("Noclip", State.noclip)
     end
     UI.restyle()
 
     local function button(parent, text, onClick)
         local b = Instance.new("TextButton")
-        b.Size = third
+        b.Size = half
         b.AutoButtonColor = false
         b.BorderSizePixel = 0
         b.BackgroundColor3 = UI.C.button
@@ -3766,8 +3894,16 @@ function UI.build()
         b.MouseButton1Click:Connect(onClick)
         return b
     end
-    button(switches2, "Report", function() pcall(Bot.dump) end)
-    UI.refs.forget = button(switches2, "Forget saved", function() pcall(Hazards.forgetAll) end)
+
+    -- third row: the report, and forgetting what it learned
+    local switches3 = Instance.new("Frame")
+    switches3.Size = UDim2.new(1, 0, 0, 28)
+    switches3.BackgroundTransparency = 1
+    switches3.LayoutOrder = nextOrder(body)
+    switches3.Parent = body
+    layout(switches3, 6, true)
+    button(switches3, "Report", function() pcall(Bot.dump) end)
+    UI.refs.forget = button(switches3, "Forget saved", function() pcall(Hazards.forgetAll) end)
 
     -- the dungeon
     local dungeon = card(body, "DUNGEON")
@@ -4253,7 +4389,7 @@ function Bot.watchBarrier(target, centre, now)
 
     if now - a.anchorT >= Config.BARRIER_STUCK or now - a.progressT >= Config.BARRIER_NO_PROGRESS then
         local dir = flat(target.pos - State.hrp.Position)
-        local hit = dir.Magnitude > 1 and Walls.cast(State.hrp.Position, dir.Unit * math.min(dir.Magnitude, 300))
+        local hit = dir.Magnitude > 1 and not State.noclip and Walls.cast(State.hrp.Position, dir.Unit * math.min(dir.Magnitude, 300))   -- (no wall stops a noclipping bot)
         if hit and hit.Distance <= Config.BARRIER_WALL_DIST then
             Bot.barriers[target.model] = {
                 centerDist = centre, pos = State.hrp.Position, holdFire = false, misses = 0,
@@ -4395,6 +4531,10 @@ function Bot.strafeStep(f, relaxed)
     if f.barrier or relaxed then   -- slide along a barrier / nothing better to be had: just don't drift far from where we are
         lo, hi = math.max(lowest, nearDist - 6), math.min(f.range * 0.97, nearDist + 6)
     end
+    -- A lane ends inside the band for one of its 16 directions only if the band is wide enough. A huge body and a short reach
+    -- can leave almost none between the closest we may stand and where the skills reach (a straight lane along that circle
+    -- ends further out than it starts): then circle a little wide of the reach rather than stand still next to a boss.
+    hi = math.max(hi, lo + Config.STRAFE_MIN_BAND)
     local area = (group.boss and not f.barrier and group.room) and Dungeon.boundsOf(group.room) or nil
     local pullHere = Bot.pullCost(me, group)
 
@@ -4432,8 +4572,7 @@ function Bot.strafeStep(f, relaxed)
         sc = sc + 0.7 * dir:Dot(tangent)                                   -- ...the same way round
         local _, d = Npcs.nearestCenter(goal, Npcs.pool)
         sc = sc - 0.03 * math.abs(d - ring)                                -- near the ring
-        local hit = Walls.cast(me + Vector3.new(0, 1, 0), dir * reach)     -- room to keep going (no dead ends)
-        sc = sc + 0.8 * math.min(1, (hit and hit.Distance or reach) / reach)
+        sc = sc + 0.8 * math.min(1, Walls.runLength(me + Vector3.new(0, 1, 0), dir, reach) / reach)   -- room to keep going (no dead ends)
         return sc
     end
 
@@ -4769,6 +4908,7 @@ function Bot.start()
     ESP.init()
     Walls.refresh(clock())
     Hazards.start()
+    Noclip.start()
 
     track(RunService.Heartbeat:Connect(Nav.drive))
     track(RunService.Heartbeat:Connect(function()
@@ -4792,6 +4932,7 @@ function Bot.stop()
 
     Nav.stopPath()
     pcall(Nav.setControls, true)
+    pcall(Noclip.restore)   -- collisions back on
     if State.hum then
         pcall(function()
             State.hum.AutoRotate = true
@@ -4833,6 +4974,6 @@ function Bot.boot()
 end
 
 API.Config, API.State, API.Log, API.Npcs, API.Dungeon, API.Hazards, API.Walls = Config, State, Log, Npcs, Dungeon, Hazards, Walls
-API.Planner, API.Nav, API.Skills, API.ESP, API.UI, API.Bot = Planner, Nav, Skills, ESP, UI, Bot
+API.Planner, API.Nav, API.Noclip, API.Skills, API.ESP, API.UI, API.Bot = Planner, Nav, Noclip, Skills, ESP, UI, Bot
 
 Bot.boot()
