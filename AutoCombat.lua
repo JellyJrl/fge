@@ -2,15 +2,19 @@
     Auto Combat - clears a dungeon on its own.
 
     The three jobs, in priority order:
-      1. IDENTIFY   Npcs      who is in the dungeon: name, health, aggro range, attack speed, which room, which group.
+      1. IDENTIFY   Npcs      who is in the dungeon: name, health, aggro range, attack speed, which room, which group,
+                              and which are bosses (huge bodies, no aggro limit: they wake once you enter the area).
                     Hazards   what is attacking: precast telegraphs, hitboxes, orbs, npc-named parts, loose models -
                               each with the time window in which it hurts.
       2. SURVIVE    Planner   a space-time search over the whole arena: every attack at once, each with its own timing,
                               plus walls and the npcs' own bodies. It finds the quickest way to a spot that stays safe,
                               and re-plans ten times a second. While nothing threatens us it stays put.
+                              After a respawn the 5s immortality is used: attacks that end before it does are ignored, the
+                              rest only count from when it ends, so the bot sprints in, attacks, and is clear in time.
       3. CLEAR      Dungeon   rooms in order: fight the room's npcs, then walk to the next room, until none are left.
-                    Skills    the buff and the attack skill, used from inside each npc's aggro range (it ignores anyone
-                              outside it - no precasts, nothing to fight).
+                    Skills    whatever is in the backpack, sorted by name into buff / attack / heal / defense / ignore.
+                              Every attack is fired from inside its own reach (calibrated from what it hits); normal
+                              npcs ignore anyone outside their aggro range, so those are fought from inside it.
 
     Dying less:  attacks are padded more when our health is low, and when something hits us that we didn't see coming;
                  the part that appeared right before such a hit is remembered (this run only) as an attack.
@@ -18,7 +22,8 @@
 
     One file, a few module tables:
       Npcs  Dungeon  Hazards  Walls  Planner  Nav  Skills  ESP  UI  Bot
-    Running the script again stops the previous run. The running bot is reachable as getgenv().__AutoCombat.
+    Running the script again stops the previous run. The running bot is reachable as getgenv().__AutoCombat;
+    getgenv().__AutoCombat.api.Bot.dump() prints a report of everything it sees (also the button in the window).
 ]]
 
 local Players = game:GetService("Players")
@@ -48,6 +53,7 @@ local Config = {
     -- ---- fighting distances (studs) ----
     MIN_DISTANCE        = 7,     -- never closer than this to an npc's body
     ATTACK_RANGE        = 90,    -- how far the attack skill is assumed to reach (to an npc's CENTRE); calibrated while fighting
+    BACKOFF             = 10,    -- while fighting, back off to the stand ring when this much closer than it
     RANGE_MARGIN        = 6,     -- stand this far inside the cast range
     USE_AGGRO_RANGE     = true,  -- npcs only react to someone inside their `aggroRange`: stand and cast inside it
     AGGRO_MARGIN        = 3,     -- ...this far inside, so we're clearly in it
@@ -58,6 +64,10 @@ local Config = {
     TARGET_SWITCH       = 2,     -- another npc must be this much closer before the target lock moves
     BODY_RADIUS         = 4,     -- an npc this wide counts as a point; only size beyond it adds keep-away distance
     FLANK_RANGE         = 60,
+    BOSS_SIZE           = 30,    -- an npc whose body is this wide (studs) is a boss: no aggro limit, must be fought inside its area
+    BOSS_NAMES          = {},    -- extra name fragments (lowercase letters/digits) that mark a boss, e.g. { "dragon", "enchantedtree" }
+    NOT_BOSS_NAMES      = {},    -- ...and ones that never are
+    BOSS_AREA_MARGIN    = 2,     -- stand at least this far inside the room's edge when fighting a boss
 
     -- ---- the dungeon ----
     ROOM_EMPTY_WAIT     = 5,     -- standing in a room this long without npcs appearing: it was empty, move on
@@ -126,7 +136,19 @@ local Config = {
     BARRIER_CAP         = 40,    -- a barrier never stretches the attack range more than this
 
     -- ---- skills ----
-    BUFF_SKILLS         = { "innerrage", "enhancedinnerrage", "innerfocus", "enhancedinnerfocus" },
+    -- Every Tool with a `cooldown` value is a skill, sorted into a kind by its name (see Skills): buff, attack, heal,
+    -- defense, or ignore (never fired). Anything unrecognised is an attack. SKILL_KINDS overrides it per tool name, e.g.
+    -- { ["Dash Strike"] = "attack", ["Taunt"] = "ignore" }.
+    SKILL_KINDS         = {},
+    BUFF_SKILLS         = { "innerrage", "enhancedinnerrage", "innerfocus", "enhancedinnerfocus" },   -- exact (normalized) names
+    BUFF_WORDS          = { "rage", "berserk", "frenzy", "bloodlust", "warcry", "battlecry", "empower", "haste", "fury", "bolster", "rally", "overdrive", "adrenaline" },
+    SPEED_WORDS         = { "innerrage", "haste", "swift", "sprint", "speed", "adrenaline", "overdrive" },   -- buffs that make us faster
+    HEAL_WORDS          = { "heal", "regen", "recover", "mend", "cure", "restore", "revive", "bandage" },
+    DEFENSE_WORDS       = { "shield", "guard", "barrier", "block", "ward", "protect", "fortify", "bulwark", "aegis", "invuln", "immun" },
+    IGNORE_WORDS        = { "dash", "blink", "teleport", "leap", "roll", "evade", "dodge", "shadowstep", "sidestep", "vault", "warp" },
+    ATTACK_WORDS        = { "bash", "slam", "throw", "strike", "blast", "bolt", "arrow", "shot", "slash", "smite", "nova", "storm", "barrage", "fireball", "meteor", "burst" },
+    HEAL_BELOW          = 0.55,  -- a heal skill is used below this share of health
+    DEFENSE_BELOW       = 0.4,   -- a defense skill is also used (when an attack is coming) below this share of health
     READY_MAX           = 0,     -- a tool is ready when its `cooldown` value is <= this (ready = -0.1)
     FALLBACK_COOLDOWN   = 8,
     MIN_GAP             = 0.8,   -- never use the same skill twice within this
@@ -135,14 +157,25 @@ local Config = {
     AIM_HOLD            = 0.3,   -- stay busy this long after firing
     CAST_CONFIRM        = 0.15,  -- after firing, check the cooldown really started
     RETRY_DELAY         = 3,     -- a skill that did nothing is left alone this long
-    RAGE_DURATION       = 3,     -- length of the buff until learned from the game's own cooldown numbers
+    RAGE_DURATION       = 3,     -- length of a buff until learned from the game's own cooldown numbers
     RAGE_DELAY          = 0.15,  -- after the buff, wait this long before the attack so its bonus is on
-    RAGE_ESCAPE_SLACK   = 0.35,  -- spend the buff on speed when we'd escape an attack with less than this to spare
+    RAGE_ESCAPE_SLACK   = 0.35,  -- spend a speed buff on escaping when we'd get out of an attack with less than this to spare
     RAGE_CROWD          = 3,     -- ...or when this many attacks are closing in and we can't attack anyway
     RAGE_CROWD_RADIUS   = 20,
-    REACH_STEP          = 5,     -- the attack range shrinks/grows by this when casts miss/connect
+    RAGE_SPEED_MULT     = 1.4,   -- assumed speed multiplier of a speed buff (for deciding whether to spend it on travel)
+    RAGE_TRAVEL_MIN_SAVED = 2.5, -- spend it on travel only if that saves at least this many seconds...
+    RAGE_TRAVEL_MAX_LOSS  = 6,   -- ...and it is back within this many seconds of arriving
+    REACH_STEP          = 5,     -- an attack's reach shrinks/grows by this when casts miss/connect (faster until it first connects)
+    REACH_FIRST_FLOOR   = 45,    -- before an attack has ever connected its reach is only shrunk down to this (a boss that hasn't woken up misses too)
+    REACH_REGROW_AFTER  = 3,     -- this many hits in a row with a shrunk reach: back off by two steps
+    PROBE_INTERVAL      = 20,    -- an attack whose reach was shrunk is tried again from further out this often
+    REACH_MAX           = 160,   -- no reach is ever believed to be more than this
+    UTILITY_STRIKES     = 3,     -- an attack that damages nothing in this many casts from well inside its reach is a utility
     HIT_WINDOW          = 1.5,   -- seconds after a cast to look for a health drop
     SPAWN_SHIELD        = 5,     -- seconds of immortality after respawning: ignore attacks, go all-in
+    SHIELD_SAFETY       = 0.4,   -- ...but stop relying on it this much early
+    SHIELD_TAIL         = 0.8,   -- being too close to an npc only matters again this long before the shield ends
+    SHIELD_SPRINT_DIST  = 12,    -- during the shield, spend a speed buff on the way in when still this far from the fight
 
     -- ---- visuals ----
     AUTO_AIM            = true,  -- always face the target (shift-lock style)
@@ -166,6 +199,8 @@ local State = {
     char = nil, hum = nil, hrp = nil,
     wasAlive = true,
     shieldUntil = 0,
+    spawnedAt = -100,      -- when the current character appeared (after a respawn)
+    ffSeen = false,        -- the spawn shield showed up as a ForceField
     ignoreDirty = false,   -- the ray filter needs a rebuild
     kills = 0,
     deaths = 0,
@@ -235,6 +270,9 @@ end
 -- workspace.dungeon.<room>.enemyFolder.<npc model>, each with a Humanoid and (usually) numbers describing it:
 --   aggroRange   how close you must be before it reacts (precasts, attacks) at all
 --   attackSpeed  how long its attack sequence (precast + hitbox) lasts
+-- Bosses are not like the rest: huge bodies (sometimes no HumanoidRootPart), and their aggroRange means nothing - they
+-- wake up when you enter the area. They are recognised (name, a boss flag, or a body wider than BOSS_SIZE) and get no
+-- aggro limit; a body too big to stand outside of is capped so the stand ring always lies inside the skills' reach.
 -- `list` is every living npc; `pool` is the ones we are fighting or heading for right now (see Dungeon.pool).
 -- =====================
 Npcs.list = {}      -- { {model, room, root, pos, radius, humanoid, hp, key, aggro, attackSpeed, group} }
@@ -276,6 +314,51 @@ function Npcs.findRoot(model)
     return best
 end
 
+-- a yes/no off any Instance: an attribute, or a Bool/Number value child
+local function readFlag(inst, names)
+    for _, name in ipairs(names) do
+        local a = inst:GetAttribute(name)
+        if a == true or (type(a) == "number" and a ~= 0) then return true end
+        local v = inst:FindFirstChild(name)
+        if v and v:IsA("ValueBase") then
+            local x = v.Value
+            if x == true or (type(x) == "number" and x ~= 0) then return true end
+        end
+    end
+    return false
+end
+
+-- Health of an npc: the Humanoid's, or (bosses without one) a Health / MaxHealth pair published as values or attributes.
+-- Returns health, max - or nil when nothing says.
+Npcs.HEALTH_NAMES = { "Health", "health", "HP", "hp", "CurrentHealth" }
+Npcs.MAX_NAMES = { "MaxHealth", "maxHealth", "MaxHP", "maxHp", "maxhp" }
+function Npcs.readHealth(model, humanoid)
+    if humanoid and humanoid.Parent then return humanoid.Health, humanoid.MaxHealth end
+    local health, max
+    for _, name in ipairs(Npcs.HEALTH_NAMES) do
+        health = readNumber(model, name)
+        if health then break end
+    end
+    if health == nil then return nil, nil end
+    for _, name in ipairs(Npcs.MAX_NAMES) do
+        max = readNumber(model, name)
+        if max then break end
+    end
+    return health, max or health
+end
+
+function Npcs.isBoss(model, key, width)
+    for _, word in ipairs(Config.NOT_BOSS_NAMES) do
+        if key:find(word, 1, true) then return false end
+    end
+    for _, word in ipairs(Config.BOSS_NAMES) do
+        if key:find(word, 1, true) then return true end
+    end
+    if key:find("boss", 1, true) then return true end
+    if readFlag(model, { "boss", "Boss", "isBoss", "IsBoss" }) then return true end
+    return width >= Config.BOSS_SIZE
+end
+
 -- Geometry is cached for ~1s (huge models aren't measured every frame); the numbers the npc publishes are cheap
 -- and read fresh, so one added a moment before its first attack is never missed.
 function Npcs.info(model, now)
@@ -284,11 +367,18 @@ function Npcs.info(model, now)
         local root = (info and info.root.Parent) and info.root or Npcs.findRoot(model)
         if not root then return nil end
         local size = model:GetExtentsSize()
+        local width = math.max(size.X, size.Z)
+        local key = normalize(model.Name)
+        -- body size beyond a point is extra keep-away distance - but never more than leaves room to stand inside the
+        -- skills' reach (a boss as big as a hill must not push the stand ring out of range)
+        local cap = math.max(0, math.max(Skills.reach or Config.ATTACK_RANGE, Config.ATTACK_RANGE) - Config.RANGE_MARGIN - Config.MIN_DISTANCE)
         info = {
             root = root, t = now,
-            radius = math.max(0, math.max(size.X, size.Z) / 2 - Config.BODY_RADIUS),   -- body size beyond a point
+            radius = math.min(cap, math.max(0, width / 2 - Config.BODY_RADIUS)),
+            width = width,
             humanoid = model:FindFirstChildOfClass("Humanoid"),
-            key = normalize(model.Name),
+            key = key,
+            boss = Npcs.isBoss(model, key, width),
         }
         Npcs.cache[model] = info
     end
@@ -311,14 +401,16 @@ function Npcs.refresh(maxAge)
             for _, model in ipairs(folder:GetChildren()) do
                 if model:IsA("Model") then
                     local info = Npcs.info(model, now)
-                    local hum = info and info.humanoid
+                    local health, max = nil, nil
+                    if info then health, max = Npcs.readHealth(model, info.humanoid) end
                     -- a dead npc lingering through its death animation is no longer a target
-                    if info and not (hum and hum.Health <= 0) then
+                    if info and not (health and health <= 0) then
                         aliveNow[model] = true
                         table.insert(list, {
                             model = model, room = room, root = info.root, pos = info.root.Position, radius = info.radius,
-                            humanoid = hum, hp = hum and hum.MaxHealth > 0 and math.clamp(hum.Health / hum.MaxHealth, 0, 1) or 1,
+                            humanoid = info.humanoid, hp = (health and max and max > 0) and math.clamp(health / max, 0, 1) or 1,
                             key = info.key, aggro = info.aggro, attackSpeed = info.attackSpeed,
+                            boss = info.boss, width = info.width,
                         })
                     end
                 end
@@ -393,7 +485,11 @@ function Npcs.buildGroups()
             for _, m in ipairs(members) do
                 radius = math.max(radius, flat(m.pos - centroid).Magnitude + m.radius)
             end
-            groups[id] = { members = members, centroid = centroid, radius = radius, count = #members }
+            local boss
+            for _, m in ipairs(members) do
+                if m.boss then boss = boss or m end
+            end
+            groups[id] = { members = members, centroid = centroid, radius = radius, count = #members, boss = boss, room = boss and boss.room or seed.room }
         end
     end
     Npcs.groups = groups
@@ -420,30 +516,34 @@ function Npcs.pick(nearest, nearestDist, me)
 end
 
 -- How far from this npc (to its centre) skills may be used: as far as the attack reaches, but never outside the npc's
--- own aggro range - it ignores anyone out there, so there would be nothing to fight. A barrier we can't pass
--- overrides the aggro limit (nothing nearer is possible; holding fire would just leave the bot idle).
+-- own aggro range - it ignores anyone out there, so there would be nothing to fight. Two exceptions:
+--  * a boss: its aggroRange means nothing, it wakes up once you enter the area
+--  * an aggro range too small to stand inside (the npc's body plus the keep-away distance already fills it)
+-- A barrier we can't pass overrides the aggro limit as well (nothing nearer is possible; holding fire would just leave the
+-- bot idle). `reach` is the skill's own reach (default: the longest of the attack skills').
 -- Returns the range and whether the aggro range is what limits it.
-function Npcs.castRange(npc, barrier)
-    local reach = Skills.reach
+function Npcs.castRange(npc, barrier, reach)
+    reach = reach or Skills.reach
     if barrier and not barrier.holdFire then
         return math.min(math.max(reach, barrier.centerDist + Config.BARRIER_LEEWAY), reach + Config.BARRIER_CAP), false
     end
     local aggro = npc and npc.aggro
-    if Config.USE_AGGRO_RANGE and aggro and aggro > 0 then
-        local inside = math.max(aggro - Config.AGGRO_MARGIN, Config.MIN_DISTANCE + 2)
-        if inside < reach then return inside, true end
+    if Config.USE_AGGRO_RANGE and aggro and aggro > 0 and not npc.boss then
+        local inside = aggro - Config.AGGRO_MARGIN
+        local standable = (npc.radius or 0) + Config.MIN_DISTANCE + Config.RANGE_MARGIN   -- a spot we may legally stand on
+        if inside >= standable and inside < reach then return inside, true end
     end
     return reach, false
 end
 
 -- the strictest cast range in a group: standing inside it puts every npc of the group in reach
-function Npcs.groupRange(group, barrier)
+function Npcs.groupRange(group, barrier, reach)
     local range = nil
     for _, m in ipairs(group and group.members or {}) do
-        local r = Npcs.castRange(m, barrier)
+        local r = Npcs.castRange(m, barrier, reach)
         if not range or r < range then range = r end
     end
-    return range or Skills.reach
+    return range or reach or Skills.reach
 end
 
 -- ---- matching an attack to the npc that cast it ----
@@ -561,9 +661,14 @@ function Dungeon.boundsOf(room)
     return b
 end
 
+-- is `pos` within the box `b` of Dungeon.boundsOf, grown by `margin` studs (negative = that far inside its edge)?
+function Dungeon.within(b, pos, margin)
+    margin = margin or 0
+    return b ~= nil and pos.X >= b.min.X - margin and pos.X <= b.max.X + margin and pos.Z >= b.min.Z - margin and pos.Z <= b.max.Z + margin
+end
+
 function Dungeon.inside(room, pos)
-    local b = Dungeon.boundsOf(room)
-    return b ~= nil and pos.X >= b.min.X - 5 and pos.X <= b.max.X + 5 and pos.Z >= b.min.Z - 5 and pos.Z <= b.max.Z + 5
+    return Dungeon.within(Dungeon.boundsOf(room), pos, 5)
 end
 
 -- Re-reads the rooms and decides which are cleared. Twice a second is plenty.
@@ -1129,7 +1234,9 @@ end
 function Hazards.window(zone, now)
     local age = now - zone.born
     if zone.kind == "precast" then
-        return math.max(0, Config.PRECAST_DELAY - age - Config.PRECAST_SAFETY), math.huge
+        -- dangerous from just before it fires, until its sequence (precast + hitbox) is over - when the npc says how long that is
+        local off = zone.seq and (math.max(zone.seq, Config.PRECAST_DELAY + 1) - age + Config.PRECAST_SAFETY) or math.huge
+        return math.max(0, Config.PRECAST_DELAY - age - Config.PRECAST_SAFETY), off
     elseif zone.kind == "hitbox" then
         if zone.duration then
             return 0, math.max(0, zone.duration - age) + Config.PRECAST_SAFETY
@@ -1142,11 +1249,19 @@ function Hazards.window(zone, now)
 end
 
 -- every zone with its window, for a batch of questions at one moment (the planner asks thousands)
+-- While we are immortal (a fresh spawn: Hazards.shieldLeft seconds more) an attack can only hurt from the moment the shield
+-- ends: one that is over by then is dropped, the rest start no earlier. The planner and everything else then simply never
+-- see the harmless part, and the bot is clear of the zones the instant the shield runs out.
+Hazards.shieldLeft = 0
+
 function Hazards.windows(now)
     local list = {}
+    local shield = Hazards.shieldLeft
     for _, zone in pairs(Hazards.active) do
         local on, off = Hazards.window(zone, now)
-        table.insert(list, { zone = zone, on = on, off = off })
+        if off > shield then
+            table.insert(list, { zone = zone, on = math.max(on, shield), off = off })
+        end
     end
     return list
 end
@@ -1816,7 +1931,8 @@ end
 -- something that should pull us off a walk: an attack about to hit where we stand, or an npc right on top of us
 function Nav.interrupted()
     local pos = State.hrp.Position
-    return Hazards.firstHit(pos, 1.2) < math.huge or Npcs.surfaceDistance(pos) < Config.MIN_DISTANCE
+    return Hazards.firstHit(pos, 1.2) < math.huge
+        or (Hazards.shieldLeft < Config.SHIELD_TAIL and Npcs.surfaceDistance(pos) < Config.MIN_DISTANCE)
 end
 
 function Nav.walk(waypoints)
@@ -1882,55 +1998,98 @@ end
 
 -- ---- where to stand ----
 
--- How far from a group's centre to stand: inside the cast range (and so inside the npcs' aggro range), but never
--- closer than BIG_BODY_GAP to the edge of a huge body.
+-- How far from a group's centre to stand: inside the cast range (and so inside the aggro range of the npcs that have a
+-- usable one), never closer than BIG_BODY_GAP to the edge of a huge body, and never outside the skills' reach.
+-- Returns the ring radius and the closest we may stand.
 function Nav.ringRadius(group, barrier)
     local range = Npcs.groupRange(group, barrier)
-    return math.max(range - Config.RANGE_MARGIN, group.radius + Config.BIG_BODY_GAP, Config.MIN_DISTANCE + 6)
+    local lowest = math.max(group.radius + Config.BIG_BODY_GAP, Config.MIN_DISTANCE + 6)
+    local r = math.max(range - Config.RANGE_MARGIN, lowest)
+    return math.min(r, math.max(range - 2, Config.MIN_DISTANCE + 6)), lowest
 end
 
--- legal points on that ring, best first: near us, and not inside the aggro range of npcs that are NOT part of this fight
+-- Legal points to stand at around a group, best first (near us, and not inside the aggro range of npcs that are NOT part
+-- of this fight). A boss wakes up when you enter its area, so for one the points must lie inside the room, on the largest
+-- ring that has any (a room smaller than the skills' reach has no point that far out).
 function Nav.ringPoints(group, barrier)
-    local ringR = Nav.ringRadius(group, barrier)
+    local ringR, lowest = Nav.ringRadius(group, barrier)
     local me = State.hrp.Position
     local wins = Hazards.windows(clock())
-    local pts = {}
-    for angle = 0, 345, 15 do
-        local r = math.rad(angle)
-        local p = Vector3.new(group.centroid.X + math.cos(r) * ringR, group.centroid.Y, group.centroid.Z + math.sin(r) * ringR)
-        if Npcs.surfaceDistance(p) >= Config.MIN_DISTANCE + 1 and not Hazards.hitWin(wins, p, 0, Config.SETTLE + 2) and Walls.floorBelow(p) then
-            table.insert(pts, { pos = p, cost = flat(p - me).Magnitude / 16 + Bot.pullCost(p, group) })
+    local bounds = (group.boss and not barrier and group.room) and Dungeon.boundsOf(group.room) or nil
+
+    local speed = math.max(State.hum.WalkSpeed, 8)
+    local function collect(radius, insideOnly)
+        local pts = {}
+        for angle = 0, 345, 15 do
+            local r = math.rad(angle)
+            local p = Vector3.new(group.centroid.X + math.cos(r) * radius, group.centroid.Y, group.centroid.Z + math.sin(r) * radius)
+            local walk = flat(p - me).Magnitude / speed
+            -- the point must be clear when we GET there (and for a while after), not just right now
+            if Npcs.surfaceDistance(p) >= Config.MIN_DISTANCE + 1 and not Hazards.hitWin(wins, p, walk, walk + Config.SETTLE + 1) and Walls.floorBelow(p)
+                and (not insideOnly or Dungeon.within(bounds, p, -Config.BOSS_AREA_MARGIN)) then
+                table.insert(pts, { pos = p, cost = walk + Bot.pullCost(p, group) })
+            end
+        end
+        return pts
+    end
+
+    local pts, usedR = collect(ringR, false), ringR
+    if bounds then
+        local radius = ringR
+        while radius >= lowest - 0.01 do
+            local inside = collect(radius, true)
+            if #inside > 0 then
+                pts, usedR = inside, radius
+                break
+            end
+            radius = radius - 8
         end
     end
     table.sort(pts, function(a, b) return a.cost < b.cost end)
     local out = {}
     for i, p in ipairs(pts) do out[i] = p.pos end
-    return out, ringR
+    return out, usedR
 end
 
 -- =====================
 -- SKILLS: ability detection and casting
 -- A skill is a Tool with a numeric `cooldown` (-0.1 = ready, otherwise counting down) and a `cooldownLength`. They are
--- scanned from the backpack at runtime, so the bot works with any loadout. The four BUFF_SKILLS names are buffs
--- (Inner Rage ...); every other tool with a cooldown is an attack skill, and the one with the longest cooldown is the
--- one used.
+-- scanned from the backpack at runtime, so the bot works with any loadout - nothing here is tied to Inner Rage / Gale
+-- Barrage. Each skill is sorted by its name into a KIND:
+--   buff     fired before attacking (Inner Rage ...); the fast ones can also be spent on speed (escaping, travelling)
+--   attack   fired at the target whenever it is inside THAT skill's reach (the default for any name it doesn't know)
+--   heal     fired when health is low
+--   defense  fired when an attack is about to land and we can't get out of its way
+--   ignore   never fired (dashes and the like: where they would take us is not something the bot can steer)
+-- Config.SKILL_KINDS overrides the sorting for a specific tool name. An "attack" that never damages anything is
+-- demoted to a utility (still fired, but it no longer decides where the bot stands). Each attack skill calibrates its
+-- own reach from what its casts hit and miss.
 -- =====================
-Skills.buff = nil             -- name of the buff skill
-Skills.attack = nil           -- name of the attack skill
-Skills.reach = Config.ATTACK_RANGE   -- how far the attack really reaches (to an npc's centre); calibrated while fighting
+Skills.list = {}              -- the skills carried, in the order they are used: { name, kind, reach, live, ... }
+Skills.byName = {}            -- [tool name] = skill record (kept across respawns: calibrated reach, hit counts)
+Skills.buff = nil             -- name of the main buff
+Skills.attack = nil           -- name of the main attack
+Skills.reach = Config.ATTACK_RANGE   -- the longest reach among the attacks (to an npc's centre): where the bot stands
 Skills.busy = false
 Skills.castUntil = 0          -- attacks that appear before this, close to us, are our own
-Skills.buffUntil = 0
 Skills.attackNotBefore = 0
-Skills.lastBuff = -100
 Skills.lastAttack = -100
+Skills.lastAttackSkill = nil
 Skills.castBarrier = nil      -- the barrier the last attack was fired against, if any
 Skills.retryAfter = {}        -- [tool name] = time before which we won't retry a skill that did nothing
 Skills.method = {}            -- [tool name] = "event" | "activate" (what worked last time)
 Skills.cooldowns = {}         -- [tool name] = { prev, peak, startT, learned }
-Skills.info = { buff = nil, attack = nil, plan = "" }
-Skills.pendingHits = {}       -- { checkAt, targets, barrier } waiting for a health check
-Skills.lastCooldown = nil     -- the attack's cooldown last frame (to see the moment it was cast)
+Skills.info = { plan = "" }
+Skills.pendingHits = {}       -- { skill, checkAt, targets, barrier, ambiguous } waiting for a health check
+
+local KIND_ORDER = { buff = 1, attack = 2, utility = 3, heal = 4, defense = 5, ignore = 6 }
+
+local function hasWord(norm, words)
+    for _, w in ipairs(words) do
+        if norm:find(w, 1, true) then return true end
+    end
+    return false
+end
 
 function Skills.isBuff(toolName)
     local n = normalize(toolName)
@@ -1940,37 +2099,111 @@ function Skills.isBuff(toolName)
     return false
 end
 
--- (re)scans the backpack and the equipped tools
+-- does this buff make us faster? (so it can be spent on escaping and travelling)
+function Skills.isSpeed(norm)
+    return hasWord(norm, Config.SPEED_WORDS)
+end
+
+-- the kind a skill is sorted into by its name
+function Skills.classify(name)
+    local norm = normalize(name)
+    local forced = Config.SKILL_KINDS[name] or Config.SKILL_KINDS[norm]
+    if forced then return forced end
+    if hasWord(norm, Config.ATTACK_WORDS) then return "attack" end   -- "Shield Bash" is an attack, not a shield
+    if Skills.isBuff(name) then return "buff" end
+    if hasWord(norm, Config.HEAL_WORDS) then return "heal" end
+    if hasWord(norm, Config.DEFENSE_WORDS) then return "defense" end
+    if hasWord(norm, Config.IGNORE_WORDS) then return "ignore" end
+    if hasWord(norm, Config.BUFF_WORDS) then return "buff" end
+    return "attack"
+end
+
+-- how far a skill is assumed to reach before anything has been seen: a value the game publishes on the tool, else the default
+local function initialReach(tool)
+    for _, key in ipairs({ "range", "Range", "maxRange", "MaxRange", "distance", "Distance" }) do
+        local v = readNumber(tool, key)
+        if v and v > 5 then return math.min(v, Config.REACH_MAX) end
+    end
+    return Config.ATTACK_RANGE
+end
+
+function Skills.recomputeReach()
+    local best = nil
+    for _, s in ipairs(Skills.list) do
+        if s.kind == "attack" then best = math.max(best or 0, s.reach) end
+    end
+    if not best then
+        for _, s in ipairs(Skills.list) do
+            if s.asAttack then best = math.max(best or 0, s.reach) end
+        end
+    end
+    Skills.reach = best or Config.ATTACK_RANGE
+end
+
+-- (re)scans the backpack and the equipped tools. Returns true when the loadout changed.
 function Skills.detect()
-    local bestBuff, bestBuffLen = nil, -1
-    local bestAttack, bestAttackLen = nil, -1
+    local found = {}
 
     local function check(t)
-        if not t:IsA("Tool") or readNumber(t, "cooldown") == nil then return end
-        local len = readNumber(t, "cooldownLength") or 0
-        if Skills.isBuff(t.Name) then
-            if len > bestBuffLen then bestBuffLen, bestBuff = len, t.Name end
-        elseif len > bestAttackLen then
-            bestAttackLen, bestAttack = len, t.Name
+        if not t:IsA("Tool") or readNumber(t, "cooldown") == nil then return end   -- no cooldown = not a skill we manage
+        if found[t.Name] then return end
+        local s = Skills.byName[t.Name]
+        local forced = Config.SKILL_KINDS[t.Name] or Config.SKILL_KINDS[normalize(t.Name)]
+        if s and forced and s.kind ~= forced then   -- the override was set after the skill was first seen
+            s.kind, s.speed = forced, forced == "buff" and Skills.isSpeed(s.norm)
         end
+        if not s then
+            local reach = initialReach(t)
+            s = {
+                name = t.Name, norm = normalize(t.Name), kind = Skills.classify(t.Name), reach = reach, baseReach = reach,
+                hits = 0, casts = 0, strikes = 0, lastUse = -100, lastProbe = -100, activeUntil = 0,
+            }
+            s.speed = s.kind == "buff" and Skills.isSpeed(s.norm)
+            Skills.byName[t.Name] = s
+        end
+        s.length = readNumber(t, "cooldownLength") or 0
+        found[t.Name] = s
     end
 
     local bp = player:FindFirstChild("Backpack")
     if bp then for _, t in ipairs(bp:GetChildren()) do check(t) end end
     if player.Character then for _, t in ipairs(player.Character:GetChildren()) do check(t) end end
 
-    local changed = false
-    if bestBuff and bestBuff ~= Skills.buff then
-        Skills.buff = bestBuff
-        Log.add("Buff skill: " .. bestBuff)
-        changed = true
+    local list = {}
+    for _, s in pairs(found) do table.insert(list, s) end
+    table.sort(list, function(a, b)
+        if a.kind ~= b.kind then return (KIND_ORDER[a.kind] or 9) < (KIND_ORDER[b.kind] or 9) end
+        if a.length ~= b.length then return a.length > b.length end
+        return a.name < b.name
+    end)
+
+    -- no attack at all (a loadout of "buffs" the sorting got wrong): the unknown-named ones are the attacks
+    local attacks = 0
+    for _, s in ipairs(list) do if s.kind == "attack" then attacks = attacks + 1 end end
+    for _, s in ipairs(list) do
+        s.asAttack = (attacks == 0 and s.kind == "buff" and not Skills.isBuff(s.name)) or nil
     end
-    if bestAttack and bestAttack ~= Skills.attack then
-        Skills.attack = bestAttack
-        Log.add("Attack skill: " .. bestAttack)
-        changed = true
+
+    local changed = #list ~= #Skills.list
+    if not changed then
+        for i, s in ipairs(list) do
+            if Skills.list[i] ~= s then changed = true break end
+        end
     end
-    if changed then UI.skillNames() end
+    Skills.list = list
+    Skills.buff, Skills.attack = nil, nil
+    for _, s in ipairs(list) do
+        if s.kind == "buff" and not Skills.buff then Skills.buff = s.name end
+        if (s.kind == "attack" or s.asAttack) and not Skills.attack then Skills.attack = s.name end
+    end
+    Skills.recomputeReach()
+
+    if changed then
+        local parts = {}
+        for _, s in ipairs(list) do table.insert(parts, s.name .. " (" .. s.kind .. ")") end
+        Log.add("Skills: " .. (#parts > 0 and table.concat(parts, ", ") or "none found"))
+        UI.skillNames()
+    end
     return changed
 end
 
@@ -2082,18 +2315,26 @@ function Skills.use(tool, label, aim)
     return true
 end
 
--- ---- the buff as a dodging tool ----
+-- everything tied to the old character is dropped (buffs are lost on death, cooldowns start over)
+function Skills.reset()
+    Skills.attackNotBefore, Skills.busy = 0, false
+    Skills.pendingHits = {}
+    Skills.retryAfter = {}
+    for _, s in pairs(Skills.byName) do
+        s.activeUntil, s.lastUse, s.live = 0, -100, nil
+    end
+end
 
--- Should the buff be spent on its SPEED? A reason, or nil:
+-- ---- the buff as a dodging / travelling tool ----
+
+-- Should a speed buff be spent on SPEED while fighting? A reason, or nil:
 --  A) an attack is about to hit us and the planner says we'd only just make it out at normal speed (its slack = how
 --     much time we'd have to spare)
 --  B) several attacks are closing in and we can't attack anyway
-function Skills.speedReason(c, attack)
+function Skills.speedReason(c, canAttack)
     if c.threatened and c.slack and c.slack < Config.RAGE_ESCAPE_SLACK then
         return string.format("buff to escape (%.1fs to spare)", math.max(c.slack, -9.9))
     end
-
-    local canAttack = attack ~= nil and attack.ready and c.centreDist <= c.range
     if not canAttack then
         local n = Hazards.nearby(State.hrp.Position, Config.RAGE_CROWD_RADIUS)
         if n >= Config.RAGE_CROWD then return string.format("buff for speed: %d attacks closing in", n) end
@@ -2101,86 +2342,183 @@ function Skills.speedReason(c, attack)
     return nil
 end
 
+-- Should a speed buff be spent on getting to the fight? Right after a respawn (we are immortal: the buff is free speed
+-- for the sprint back) always when far; otherwise only when it saves real time and is back soon after arriving.
+function Skills.travelReason(s, c)
+    if not c.approaching or not c.travel or c.travel <= 0 then return nil end
+    if c.shielded and c.travel > Config.SHIELD_SPRINT_DIST then return "respawn sprint: speed buff to reach the fight" end
+    local base = math.max(State.hum.WalkSpeed, 1)
+    local travelTime = c.travel / (base * Config.RAGE_SPEED_MULT)
+    local saved = c.travel / base - travelTime
+    local lost = math.max(0, s.live.length - travelTime)   -- how long we'd then be without it after arriving
+    if saved >= Config.RAGE_TRAVEL_MIN_SAVED and lost <= Config.RAGE_TRAVEL_MAX_LOSS then
+        return string.format("buff for travel (saves ~%.1fs)", saved)
+    end
+    return nil
+end
+
 -- ---- using the skills: once per frame, after movement ----
--- c = { now, npc (nearest by centre), centreDist, range, byAggro, threatened, slack, shielded, barrier }
+-- c = { now, npc (nearest by centre), centreDist, barrier, threatened, slack, shielded, hpFrac, approaching, travel }
 function Skills.update(c)
     local now = c.now
-    local buff = Skills.buff and Skills.get(Skills.buff, Skills.lastBuff) or nil
-    local attack = Skills.attack and Skills.get(Skills.attack, Skills.lastAttack) or nil
-    Skills.info.buff, Skills.info.attack, Skills.info.plan = buff, attack, ""
     local info = Skills.info
-
-    if Skills.busy or not c.npc then return end
+    info.plan = ""
+    for _, s in ipairs(Skills.list) do s.live = Skills.get(s.name, s.lastUse) end
+    if Skills.busy then return end
     if c.shielded then info.plan = "spawn shield: all-in attack" end
 
-    -- a cooldown above cooldownLength means the buff is still running
-    local buffActive = now < Skills.buffUntil or (buff ~= nil and buff.remaining > buff.length + 0.3)
-
-    local function fireBuff(reason)
-        if Skills.use(buff.tool, Skills.buff, false) then
-            Skills.lastBuff = now
-            Skills.buffUntil = now + ((buff.extra or 0) >= 0.5 and buff.extra or Config.RAGE_DURATION)
-            info.plan = reason
+    local function ready(s) return s.live ~= nil and s.live.ready end
+    local function buffActive(s)
+        return now < s.activeUntil or (s.live ~= nil and s.live.remaining > s.live.length + 0.3)   -- cooldown above its length = still running
+    end
+    local function cast(s, reason, aim)
+        if Skills.use(s.live.tool, s.name, aim) then
+            s.lastUse = now
+            s.casts = s.casts + 1
+            if reason then info.plan = reason end
+            return true
+        end
+        return false
+    end
+    local function fireBuff(s, reason)
+        if cast(s, reason, false) then
+            s.activeUntil = now + ((s.live.extra or 0) >= 0.5 and s.live.extra or Config.RAGE_DURATION)
+            if reason ~= "buff first, then attack" then Log.add(s.name .. ": " .. reason) end   -- why it was spent early
             return true
         end
         return false
     end
 
-    -- survival first: the buff's speed can be the difference between dodging and being hit
-    if buff and buff.ready and not buffActive and not c.shielded then
-        local why = Skills.speedReason(c, attack)
-        if why and fireBuff(why) then return end
+    -- survival first
+    if not c.shielded then
+        for _, s in ipairs(Skills.list) do
+            if ready(s) then
+                if s.kind == "heal" and (c.hpFrac or 1) < Config.HEAL_BELOW then
+                    if cast(s, "heal: health low") then return end
+                elseif s.kind == "defense" and c.threatened
+                    and ((c.slack and c.slack < Config.RAGE_ESCAPE_SLACK) or (c.hpFrac or 1) < Config.DEFENSE_BELOW) then
+                    if cast(s, "defense: an attack is about to land") then return end
+                end
+            end
+        end
     end
 
-    if not attack then
+    -- the attacks that could be fired right now: ready, and the target inside their reach
+    local anyAttack, fireable, probing = false, nil, false
+    if c.npc then
+        local blocked = c.barrier and c.barrier.holdFire
+        for _, s in ipairs(Skills.list) do
+            if s.kind == "attack" or s.kind == "utility" or s.asAttack then
+                anyAttack = true
+                if ready(s) and not fireable then
+                    local limit = Npcs.castRange(c.npc, c.barrier, s.reach)
+                    if blocked then
+                        info.plan = "attack isn't reaching from the barrier, holding"
+                    elseif c.centreDist <= limit then
+                        fireable = s
+                    elseif s.reach < s.baseReach and now - s.lastProbe >= Config.PROBE_INTERVAL
+                        and c.centreDist <= Npcs.castRange(c.npc, c.barrier, s.baseReach) then
+                        -- Its reach was shrunk after misses (a boss that hadn't woken up, a phase it couldn't be hurt in ...):
+                        -- every so often try from where we stand, so a skill that works again isn't written off for good.
+                        fireable, probing = s, true
+                        info.plan = s.name .. ": probe shot (reach was shrunk)"
+                    elseif info.plan == "" then
+                        info.plan = string.format("%s ready, out of range (%.0f / %.0f)", s.name, c.centreDist, limit)
+                    end
+                end
+            end
+        end
+    end
+
+    -- the speed buffs: escaping, travelling
+    for _, s in ipairs(Skills.list) do
+        if s.kind == "buff" and s.speed and ready(s) and not buffActive(s) and not c.shielded then
+            local why = Skills.speedReason(c, fireable ~= nil)
+            if why and fireBuff(s, why) then return end
+        end
+    end
+    if not c.npc then return end
+    for _, s in ipairs(Skills.list) do
+        if s.kind == "buff" and s.speed and ready(s) and not buffActive(s) then
+            local why = Skills.travelReason(s, c)
+            if why and fireBuff(s, why) then return end
+        end
+    end
+
+    if not anyAttack then
         if info.plan == "" then info.plan = "no attack skill in backpack" end
         return
     end
-    if not attack.ready then
-        if info.plan == "" then info.plan = string.format("attack cooldown %.1fs", attack.remaining) end
+    if not fireable then
+        if info.plan == "" then
+            local soonest = nil
+            for _, s in ipairs(Skills.list) do
+                if (s.kind == "attack" or s.kind == "utility" or s.asAttack) and s.live then
+                    soonest = math.min(soonest or math.huge, s.live.remaining)
+                end
+            end
+            if soonest then info.plan = string.format("attack cooldown %.1fs", soonest) end
+        end
         return
     end
 
-    -- the target must be inside the cast range: the attack's reach, kept inside the npc's aggro range
-    if c.barrier and c.barrier.holdFire then
-        info.plan = "attack isn't reaching from the barrier, holding"
-        return
-    end
-    if c.centreDist > c.range then
-        info.plan = string.format("attack ready, out of range (%.0f / %.0f%s)", c.centreDist, c.range, c.byAggro and ", inside its aggro range" or "")
-        return
-    end
-
-    if buff and not buffActive and buff.ready then   -- buff first (damage), a moment for it to take effect, then the attack
-        if fireBuff("buff first, then attack") then Skills.attackNotBefore = now + Config.RAGE_DELAY end
-        return
+    -- buffs first (damage), a moment for them to take effect, then the attack
+    for _, s in ipairs(Skills.list) do
+        if s.kind == "buff" and not s.asAttack and ready(s) and not buffActive(s) then
+            if fireBuff(s, "buff first, then attack") then Skills.attackNotBefore = now + Config.RAGE_DELAY end
+            return
+        end
     end
     if now < Skills.attackNotBefore then
         info.plan = "buff ramping up"
         return
     end
 
-    if Skills.use(attack.tool, Skills.attack, true) then
+    if cast(fireable, probing and (fireable.name .. ": probe shot (reach was shrunk)") or ("attack fired: " .. fireable.name), true) then
+        if probing then fireable.lastProbe = now end
         Skills.lastAttack = now
+        Skills.lastAttackSkill = fireable
         Skills.castBarrier = c.barrier
-        info.plan = "attack fired"
     end
 end
 
 -- ---- calibration: does the attack connect from here? ----
--- When the attack's cooldown starts (a cast), nearby npcs' health is noted; a moment later, a drop means it connected
--- from that distance (the range grows to it), no drop at near the edge of the range means it fell short (the range
--- shrinks a little, so the bot stands closer next time). Against a barrier, repeated misses stop the bot wasting casts.
+-- When an attack's cooldown starts (a cast), nearby npcs' health is noted; a moment later, a drop means it connected
+-- from that distance (its reach grows to it), no drop at near the edge of its reach means it fell short (the reach shrinks,
+-- quickly until the skill has connected once, so the bot stands closer next time). A skill that never damages anything
+-- from well inside its reach is demoted to a utility. Against a barrier, repeated misses stop the bot wasting casts.
+local function healthNow(t)
+    local health = Npcs.readHealth(t.model, t.humanoid)
+    return health
+end
+
 function Skills.watch(now)
     for i = #Skills.pendingHits, 1, -1 do
         local p = Skills.pendingHits[i]
         if now >= p.checkAt then
+            local s = p.skill
             local hit = false
             for _, t in ipairs(p.targets) do
-                local ok, health = pcall(function() return t.humanoid.Health end)
-                if (not ok) or t.humanoid.Parent == nil or health <= t.health - 1 then
+                local gone = t.model.Parent == nil
+                local health = (not gone) and healthNow(t) or nil
+                if gone or (health ~= nil and health <= t.health - 1) then
                     hit = true
-                    if t.dist > Skills.reach then Skills.reach = math.ceil(t.dist) end
+                    if not p.ambiguous and t.dist > s.reach and t.dist <= Config.REACH_MAX then s.reach = math.ceil(t.dist) end
+                end
+            end
+
+            if hit then
+                s.hits, s.strikes, s.streak = s.hits + 1, 0, (s.streak or 0) + 1
+                -- connecting steadily with a shrunk reach: it may reach further than it was cut to, so back off again
+                -- (a miss at the longer distance shrinks it right back)
+                if s.streak >= Config.REACH_REGROW_AFTER and s.reach < s.baseReach and not p.barrier then
+                    s.reach = math.min(s.baseReach, s.reach + Config.REACH_STEP * 2)
+                    s.streak = 0
+                    Log.add(string.format("%s keeps connecting - backing off (reach now %d)", s.name, s.reach))
+                end
+                if s.kind == "utility" then
+                    s.kind = "attack"
+                    Log.add(s.name .. " damages after all - an attack again")
                 end
             end
 
@@ -2188,44 +2526,68 @@ function Skills.watch(now)
                 if hit then
                     p.barrier.misses = 0
                     p.barrier.holdFire = false
-                else
+                elseif not p.ambiguous then
                     p.barrier.misses = p.barrier.misses + 1
                     if p.barrier.misses >= 2 and not p.barrier.holdFire then
                         p.barrier.holdFire = true
                         Log.add("Attack isn't reaching from the barrier, holding fire")
                     end
                 end
-            elseif not hit and p.targets[1] and p.targets[1].dist >= Skills.reach * 0.85 then
-                local shorter = math.max(Config.MIN_DISTANCE + Config.RANGE_MARGIN + 4, Skills.reach - Config.REACH_STEP)
-                if shorter < Skills.reach then
-                    Skills.reach = shorter
-                    Log.add(string.format("Attacks not connecting - closing in (reach now %d)", Skills.reach))
+            elseif not hit and not p.ambiguous and p.targets[1] then
+                local nearest = p.targets[1].dist
+                s.streak = 0
+                if nearest >= s.reach * 0.85 then
+                    -- until it has connected once: quickly down to FIRST_FLOOR (most skills reach that far); then slowly
+                    local floor_ = Config.MIN_DISTANCE + Config.RANGE_MARGIN + 4
+                    local shorter
+                    if s.hits == 0 and s.reach > Config.REACH_FIRST_FLOOR then
+                        shorter = math.max(Config.REACH_FIRST_FLOOR, s.reach * 0.8)
+                    else
+                        shorter = math.max(floor_, s.reach - Config.REACH_STEP)
+                    end
+                    if shorter < s.reach then
+                        s.reach = math.floor(shorter)
+                        Log.add(string.format("%s not connecting - closing in (reach now %d)", s.name, s.reach))
+                    end
+                elseif nearest <= s.reach * 0.6 and s.kind == "attack" and s.hits == 0 then
+                    s.strikes = s.strikes + 1   -- well inside its reach and still nothing: maybe it isn't a damage skill
+                    if s.strikes >= Config.UTILITY_STRIKES then
+                        s.kind = "utility"
+                        Log.add(s.name .. " never damages anything - treated as a utility")
+                    end
                 end
             end
+            Skills.recomputeReach()
             table.remove(Skills.pendingHits, i)
         end
     end
 
-    local tool = Skills.attack and findTool(Skills.attack)
-    local cd = tool and readNumber(tool, "cooldown")
-    local prev = Skills.lastCooldown
-    Skills.lastCooldown = cd
-    if cd ~= nil and prev ~= nil and prev <= Config.READY_MAX and cd > Config.READY_MAX and State.hrp then
-        local targets = {}
-        for _, n in ipairs(Npcs.list) do
-            if n.humanoid then
-                local ok, health = pcall(function() return n.humanoid.Health end)
-                if ok then
-                    table.insert(targets, { humanoid = n.humanoid, health = health, dist = flat(State.hrp.Position - n.pos).Magnitude })
+    -- a cast shows up as the cooldown starting
+    for _, s in ipairs(Skills.list) do
+        if s.kind == "attack" or s.kind == "utility" or s.asAttack then
+            local tool = findTool(s.name)
+            local cd = tool and readNumber(tool, "cooldown")
+            local prev = s.lastCd
+            s.lastCd = cd
+            if cd ~= nil and prev ~= nil and prev <= Config.READY_MAX and cd > Config.READY_MAX and State.hrp then
+                local targets = {}
+                for _, n in ipairs(Npcs.list) do
+                    local health = Npcs.readHealth(n.model, n.humanoid)
+                    if health then
+                        table.insert(targets, { model = n.model, humanoid = n.humanoid, health = health, dist = flat(State.hrp.Position - n.pos).Magnitude })
+                    end
+                end
+                table.sort(targets, function(a, b) return a.dist < b.dist end)
+                if #targets > 0 then
+                    -- another cast still waiting for its check: whose damage is whose can't be told
+                    local ambiguous = #Skills.pendingHits > 0
+                    for _, other in ipairs(Skills.pendingHits) do other.ambiguous = true end
+                    table.insert(Skills.pendingHits, {
+                        skill = s, checkAt = now + Config.HIT_WINDOW, targets = targets, ambiguous = ambiguous,
+                        barrier = (now - Skills.lastAttack < 1.5 and Skills.lastAttackSkill == s) and Skills.castBarrier or nil,
+                    })
                 end
             end
-        end
-        table.sort(targets, function(a, b) return a.dist < b.dist end)
-        if #targets > 0 then
-            table.insert(Skills.pendingHits, {
-                checkAt = now + Config.HIT_WINDOW, targets = targets,
-                barrier = (now - Skills.lastAttack < 1.5) and Skills.castBarrier or nil,
-            })
         end
     end
 end
@@ -2575,8 +2937,8 @@ function ESP.update(now, stats)
         data.highlight.FillTransparency = isTarget and 0.4 or 0.7
         data.gui.Enabled = on and Config.ESP_LABELS
         if text then
-            data.label.Text = string.format("%s%s  %.0f%%  %.0f%s", isTarget and "> " or "", n.model.Name, n.hp * 100, surface,
-                n.aggro and string.format("  (aggro %.0f)", n.aggro) or "")
+            data.label.Text = string.format("%s%s%s  %.0f%%  %.0f%s", isTarget and "> " or "", n.boss and "[BOSS] " or "", n.model.Name, n.hp * 100, surface,
+                (n.aggro and not n.boss) and string.format("  (aggro %.0f)", n.aggro) or "")
             data.label.TextColor3 = tooClose and ESP.RED or (isTarget and ESP.GREEN or ESP.WHITE)
         end
         if on then
@@ -2592,7 +2954,7 @@ function ESP.update(now, stats)
     else
         ESP.ring.Transparency = 1
     end
-    if on and stats.target and stats.target.aggro then
+    if on and stats.target and stats.target.aggro and not stats.target.boss then
         flatDisc(ESP.aggroRing, stats.target.pos, stats.target.aggro * 2, 0.93)
     else
         ESP.aggroRing.Transparency = 1
@@ -2756,13 +3118,14 @@ local function row(parent, key)
     r.LayoutOrder = nextOrder(parent)
     r.Parent = parent
     local k = label(r, 13, Enum.Font.Gotham, UI.C.dim)
-    k.Size = UDim2.new(0.3, 0, 1, 0)
+    k.Size = UDim2.new(0.4, 0, 1, 0)
     k.Text = key
+    k.TextTruncate = Enum.TextTruncate.AtEnd
     local v = label(r, 13, Enum.Font.GothamMedium, UI.C.text, Enum.TextXAlignment.Right)
-    v.Size = UDim2.new(0.7, 0, 1, 0)
-    v.Position = UDim2.fromScale(0.3, 0)
+    v.Size = UDim2.new(0.6, 0, 1, 0)
+    v.Position = UDim2.fromScale(0.4, 0)
     v.TextTruncate = Enum.TextTruncate.AtEnd
-    return v, k
+    return v, k, r
 end
 
 local function bar(parent)
@@ -2972,6 +3335,21 @@ function UI.build()
     end
     UI.restyle()
 
+    local dump = Instance.new("TextButton")
+    dump.Size = UDim2.new(1, 0, 0, 24)
+    dump.AutoButtonColor = false
+    dump.BorderSizePixel = 0
+    dump.BackgroundColor3 = UI.C.button
+    dump.TextColor3 = UI.C.dim
+    dump.Font = Enum.Font.GothamMedium
+    dump.TextSize = 12
+    dump.Text = "Print report to console"
+    dump.LayoutOrder = nextOrder(body)
+    dump.Parent = body
+    corner(dump, 7)
+    outline(dump, UI.C.line, 1, 0.3)
+    dump.MouseButton1Click:Connect(function() pcall(Bot.dump) end)
+
     -- the dungeon
     local dungeon = card(body, "DUNGEON")
     UI.refs.room = row(dungeon, "Room")
@@ -3004,13 +3382,16 @@ function UI.build()
     UI.refs.threat = row(threats, "Status")
     UI.refs.threatBar = bar(threats)
 
-    -- skills
+    -- skills: one row per skill carried (hidden when unused)
     local skills = card(body, "SKILLS")
-    UI.refs.buff, UI.refs.buffKey = row(skills, Skills.buff or "Buff skill")
-    UI.refs.buffBar = bar(skills)
-    UI.refs.attack, UI.refs.attackKey = row(skills, Skills.attack or "Attack skill")
-    UI.refs.attackBar = bar(skills)
+    UI.refs.skillRows = {}
+    for i = 1, UI.MAX_SKILLS do
+        local value, key, frame = row(skills, "")
+        local b = bar(skills)
+        UI.refs.skillRows[i] = { value = value, key = key, frame = frame, bar = b }
+    end
     UI.refs.reachRow = row(skills, "Reach")
+    UI.skillNames()
 
     local logCard = card(body, "LOG")
     UI.refs.log = label(logCard, 12, Enum.Font.Code, UI.C.dim)
@@ -3020,10 +3401,22 @@ function UI.build()
     UI.refs.log.LayoutOrder = nextOrder(logCard)
 end
 
--- the skill names are only known once the backpack has been scanned, which can happen after the window was built
+-- the skills are only known once the backpack has been scanned, which can happen after the window was built
+UI.MAX_SKILLS = 8
+local KIND_COLORS = { buff = "yellow", attack = "orange", utility = "grey", heal = "green", defense = "blue", ignore = "dim" }
+
 function UI.skillNames()
-    if UI.refs.buffKey then UI.refs.buffKey.Text = Skills.buff or "Buff skill" end
-    if UI.refs.attackKey then UI.refs.attackKey.Text = Skills.attack or "Attack skill" end
+    local rows = UI.refs.skillRows
+    if not rows then return end
+    for i, r in ipairs(rows) do
+        local sk = Skills.list[i]
+        r.frame.Visible = sk ~= nil
+        r.bar.track.Visible = sk ~= nil
+        if sk then
+            r.key.Text = esc(sk.name)
+            r.key.TextColor3 = UI.C[KIND_COLORS[sk.kind] or "dim"]
+        end
+    end
 end
 
 -- bar = charging up; full green = ready; yellow = buff running out
@@ -3060,7 +3453,9 @@ function UI.update()
     if st.target then
         r.target.Text = string.format("%s  %s", esc(st.target.model.Name), col(UI.C.dim, string.format("%.0f studs", st.centreDist or 0)))
         local inside = (st.centreDist or math.huge) <= st.castRange
-        if st.target.aggro then
+        if st.target.boss then
+            r.reach.Text = col(UI.C.purple, "<b>BOSS</b>") .. col(UI.C.dim, string.format("  cast within %.0f  %s", st.castRange, inside and "(inside)" or "(outside)"))
+        elseif st.target.aggro then
             r.reach.Text = col(inside and UI.C.green or UI.C.orange, string.format("%.0f", st.target.aggro))
                 .. col(UI.C.dim, string.format("  cast within %.0f  %s", st.castRange, inside and "(inside)" or "(outside)"))
         else
@@ -3096,7 +3491,8 @@ function UI.update()
     for i = 1, math.min(4, #near) do
         local n = near[i].n
         local mark = (st.target and n.model == st.target.model) and ">" or " "
-        rows[i] = col(UI.C.dim, string.format("%s %-16s %3.0f%% %4.0f  aggro %s", mark, esc(n.model.Name):sub(1, 16), n.hp * 100, near[i].d, n.aggro and string.format("%.0f", n.aggro) or "-"))
+        rows[i] = col(n.boss and UI.C.purple or UI.C.dim, string.format("%s %-16s %3.0f%% %4.0f  %s", mark, esc(n.model.Name):sub(1, 16), n.hp * 100, near[i].d,
+            n.boss and "boss" or ("aggro " .. (n.aggro and string.format("%.0f", n.aggro) or "-"))))
     end
     r.npcs.Text = #rows > 0 and table.concat(rows, "\n") or col(UI.C.dim, "no npcs")
 
@@ -3129,13 +3525,32 @@ function UI.update()
     end
     local pad = Hazards.extraPad
     if pad > 0.05 then r.threat.Text = r.threat.Text .. col(UI.C.dim, string.format("  (+%.1f caution)", pad)) end
+    if Hazards.shieldLeft > 0 then
+        r.threat.Text = col(UI.C.purple, string.format("<b>SHIELD</b>  %.1fs of immortality", Hazards.shieldLeft))
+        setBar(r.threatBar, Hazards.shieldLeft / Config.SPAWN_SHIELD, UI.C.purple)
+    end
 
-    -- the buff's cooldown starts at (buff time + cooldownLength): the part above cooldownLength is the BUFF
-    local buff = Skills.info.buff
-    local left = Skills.buffUntil - now
-    if buff then left = math.max(left, buff.remaining - buff.length) end
-    skillRow(r.buff, r.buffBar, buff, left > 0.05 and left or nil, (buff and buff.extra >= 0.5) and buff.extra or Config.RAGE_DURATION)
-    skillRow(r.attack, r.attackBar, Skills.info.attack, nil, 1)
+    -- a buff's cooldown starts at (buff time + cooldownLength): the part above cooldownLength is the BUFF
+    if r.skillRows then
+        for i, rr in ipairs(r.skillRows) do
+            local sk = Skills.list[i]
+            if sk then
+                local live = sk.live
+                if sk.kind == "ignore" then
+                    rr.value.Text = col(UI.C.dim, "not used")
+                    setBar(rr.bar, 0, UI.C.dim)
+                elseif sk.kind == "buff" and live then
+                    local left = math.max(sk.activeUntil - now, live.remaining - live.length)
+                    skillRow(rr.value, rr.bar, live, left > 0.05 and left or nil, (live.extra >= 0.5) and live.extra or Config.RAGE_DURATION)
+                else
+                    skillRow(rr.value, rr.bar, live, nil, 1)
+                    if live and (sk.kind == "attack" or sk.kind == "utility") then
+                        rr.value.Text = rr.value.Text .. col(UI.C.dim, string.format("  reach %.0f", sk.reach))
+                    end
+                end
+            end
+        end
+    end
     r.reachRow.Text = string.format("%.0f studs", Skills.reach)
 
     local lines = {}
@@ -3170,6 +3585,7 @@ Bot.lastError = 0
 Bot.lastNoPath = 0
 Bot.lastStep = nil
 Bot.lastUnseen = 0
+Bot.lastDetect = 0
 Bot.stopped = false
 
 -- one bad frame (a part vanishing mid-death ...) must never kill the loop or flood the output
@@ -3193,12 +3609,13 @@ end
 -- ---- death / respawn: everything tied to the old character is dropped ----
 
 function Bot.reset(reason)
+    Hazards.shieldLeft = 0   -- (set again every frame while the shield lasts)
     Nav.stopPath()
     ESP.clearPath()
     ESP.setPlan(nil)
     Nav.stop()
     Nav.plan, Nav.pathGoal, Nav.lastPos, Nav.lastMove, Nav.computing = nil, nil, nil, clock(), false
-    Skills.buffUntil, Skills.attackNotBefore, Skills.busy = 0, 0, false   -- buffs are lost on death
+    Skills.reset()   -- buffs are lost on death, cooldowns start over
     Log.add(reason)
 end
 
@@ -3230,6 +3647,11 @@ function Bot.onDamage(amount, pos)
 end
 
 function Bot.onCharacter(char, initial)
+    local born = clock()   -- the spawn shield counts from here, not from when the humanoid finished loading
+    if not initial then
+        State.shieldUntil = born + Config.SPAWN_SHIELD - Config.SHIELD_SAFETY
+        State.spawnedAt, State.ffSeen = born, false
+    end
     task.spawn(function()
         local hum = char:WaitForChild("Humanoid", 10)
         local root = char:WaitForChild("HumanoidRootPart", 10)
@@ -3250,10 +3672,7 @@ function Bot.onCharacter(char, initial)
         end
 
         -- a fresh spawn is immortal for a few seconds: spend them attacking
-        if not initial then
-            State.shieldUntil = clock() + Config.SPAWN_SHIELD
-            Log.add("Spawn shield: all-in attack")
-        end
+        if not initial then Log.add(string.format("Spawn shield: %.1fs of immortality - all-in", math.max(0, State.shieldUntil - clock()))) end
 
         local lastHealth = hum.Health
         hum.HealthChanged:Connect(function(health)
@@ -3294,6 +3713,7 @@ end
 
 -- switched off: hand everything back once, then just keep the window fresh
 function Bot.idle(now)
+    Hazards.shieldLeft = 0
     if State.wasEnabled then
         State.wasEnabled = false
         State.hum.AutoRotate = true
@@ -3306,6 +3726,22 @@ function Bot.idle(now)
         State.setMode("OFF")
     end
     Bot.refreshUI(now)
+end
+
+-- Seconds of spawn immortality left. A ForceField on the new character is the game's own marker for it: once that is
+-- gone the shield is over, however much of our timer is left.
+function Bot.shieldLeft(now)
+    local left = State.shieldUntil - now
+    if left <= 0 then return 0 end
+    local ff = State.char and State.char:FindFirstChildOfClass("ForceField")
+    if ff then
+        State.ffSeen = true
+    elseif State.ffSeen then
+        State.shieldUntil = now
+        Log.add("Spawn shield over (ForceField gone)")
+        return 0
+    end
+    return left
 end
 
 -- ---- what makes a good place to stand ----
@@ -3325,12 +3761,15 @@ end
 
 -- Everything about a spot that isn't "can I get there safely": inside the cast range, not in front of an npc, not waking
 -- another group. Returned as extra seconds-of-walking, so the planner can weigh it against the way there.
-function Bot.penaltyFor(group, range)
+function Bot.penaltyFor(group, range, ring)
     local high = range * 0.95
+    local area = (group and group.boss and group.room) and Dungeon.boundsOf(group.room) or nil   -- a boss wakes when we enter its area
     return function(pos)
         local pen = 0
+        if area and not Dungeon.within(area, pos, -Config.BOSS_AREA_MARGIN) then pen = pen + 4 end
         local _, centre = Npcs.nearestCenter(pos, Npcs.pool)
         if centre > high then pen = pen + (centre - high) * 0.5 end
+        if ring and centre < ring then pen = pen + (ring - centre) * 0.05 end   -- as far out as the skills allow is safest
         for _, n in ipairs(Npcs.pool) do   -- mild: not right in front of an npc
             local to = flat(pos - n.pos)
             local dist = to.Magnitude
@@ -3451,6 +3890,10 @@ function Bot.approachStep(f)
         if not Nav.pathGoal or Npcs.surfaceDistance(Nav.pathGoal) < Config.MIN_DISTANCE + 1
             or (not f.barrier and math.abs(flat(Nav.pathGoal - f.group.centroid).Magnitude - ringR) > 4) then
             needPath = true
+        else
+            -- an attack appeared over where we are heading: choose again
+            local walk = flat(Nav.pathGoal - State.hrp.Position).Magnitude / f.speed
+            if Hazards.hitWin(f.wins, Nav.pathGoal, walk, walk + Config.SETTLE + 1) then needPath = true end
         end
 
         if needPath then
@@ -3498,7 +3941,10 @@ function Bot.fightStep(f)
     State.setMode(f.shielded and "ALL-IN" or (f.atBarrier and "SIEGE" or "FIGHT"))
 
     local pull = Bot.pullCost(me, f.group)
-    local needMove = f.centre > f.range * 0.95 or f.surface < Config.MIN_DISTANCE + 2 or pull > 0
+    local area = (f.group and f.group.boss and not f.barrier and f.group.room) and Dungeon.boundsOf(f.group.room) or nil
+    local outside = area ~= nil and not Dungeon.within(area, me, -Config.BOSS_AREA_MARGIN)
+    local tooNear = f.ring ~= nil and not f.barrier and f.centre < f.ring - Config.BACKOFF   -- closer than needed (the reach was shrunk, then grew back)
+    local needMove = f.centre > f.range * 0.95 or f.surface < Config.MIN_DISTANCE + 2 or pull > 0 or outside or tooNear
     if not needMove then
         Nav.plan = nil
         Nav.stop()
@@ -3605,7 +4051,13 @@ function Bot.step()
     Npcs.pool = Dungeon.pool(Npcs.list, me)
     Npcs.buildGroups()
     Skills.watch(now)
-    Hazards.setCaution(State.hum.MaxHealth > 0 and State.hum.Health / State.hum.MaxHealth or 1, dt)
+    local hpFrac = State.hum.MaxHealth > 0 and State.hum.Health / State.hum.MaxHealth or 1
+    Hazards.setCaution(hpFrac, dt)
+    -- the backpack can fill in after the character appears: look again often right after a spawn
+    if now - Bot.lastDetect >= ((now - State.spawnedAt < 8) and 0.25 or 3) then
+        Bot.lastDetect = now
+        Skills.detect()
+    end
 
     local stats = Bot.stats
     local pool = Npcs.pool
@@ -3615,13 +4067,16 @@ function Bot.step()
     for _, n in ipairs(pool) do inPool[n.model] = true end
     stats.inPool = inPool
 
-    -- will anything hit where we stand? (spawn immortality: attacks can't hurt us, so ignore them and go all-in)
-    local shielded = now < State.shieldUntil
+    -- Spawn immortality: attacks that end before it does can't hurt us and the rest only count from when it ends (see
+    -- Hazards.windows) - so the bot walks straight through everything, attacks, and is clear of the zones as it runs out.
+    local shieldLeft = Bot.shieldLeft(now)
+    local shielded = shieldLeft > 0
+    Hazards.shieldLeft = shieldLeft
     local wins = Hazards.windows(now)
-    local hitIn = shielded and math.huge or Hazards.firstHitWin(wins, me, Config.HORIZON)
+    local hitIn = Hazards.firstHitWin(wins, me, Config.HORIZON)
     local threatened = hitIn < math.huge
     local anyNpc, anySurface = Npcs.nearest(me, Npcs.list)
-    local tooClose = not shielded and anyNpc ~= nil and anySurface < Config.MIN_DISTANCE
+    local tooClose = shieldLeft < Config.SHIELD_TAIL and anyNpc ~= nil and anySurface < Config.MIN_DISTANCE
     local speed = math.max(State.hum.WalkSpeed, 8)
 
     if not target then
@@ -3632,7 +4087,7 @@ function Bot.step()
             ESP.setPlan(nil)
             Bot.advanceStep({ now = now })
         end
-        Skills.update({ now = now })
+        Skills.update({ now = now, threatened = threatened, slack = Bot.stats.slack, shielded = shielded, hpFrac = hpFrac })
         ESP.update(now, stats)
         Bot.refreshUI(now)
         return
@@ -3643,20 +4098,21 @@ function Bot.step()
     local targetCentre = flat(me - target.pos).Magnitude
     local barrier = Bot.barrierOf(target, targetCentre, now)
     local atBarrier = barrier ~= nil and targetCentre <= barrier.centerDist + Config.BARRIER_LEEWAY
-    local castRange, byAggro = Npcs.castRange(reachNpc, barrier)
+    local castRange = Npcs.castRange(reachNpc, barrier)
     local groupRange = Npcs.groupRange(group, barrier)
 
     stats.target, stats.group, stats.barrier = target, group, barrier
     stats.centreDist = targetCentre
     stats.castRange = (Npcs.castRange(target, barrier))
-    stats.standRadius = group and Nav.ringRadius(group, barrier) or nil
+    local ring = group and Nav.ringRadius(group, barrier) or nil
+    stats.standRadius = ring
     if not threatened then stats.slack = nil end
 
     local f = {
         now = now, target = target, group = group, barrier = barrier, atBarrier = atBarrier,
         centre = centre, surface = surface, range = groupRange, speed = speed, wins = wins,
         threatened = threatened, tooClose = tooClose, shielded = shielded,
-        penalty = Bot.penaltyFor(group, groupRange),
+        penalty = Bot.penaltyFor(group, groupRange, ring), ring = ring,
     }
 
     if threatened or tooClose then
@@ -3675,12 +4131,82 @@ function Bot.step()
     -- skills get their turn every frame (the attack aims itself when it fires)
     Nav.aim = group and ((group.count >= 2) and group.centroid or target.pos) or nil
     Skills.update({
-        now = now, npc = reachNpc, centreDist = centre, range = castRange, byAggro = byAggro,
-        threatened = threatened, slack = stats.slack, shielded = shielded, barrier = barrier,
+        now = now, npc = reachNpc, centreDist = centre, barrier = barrier, threatened = threatened, slack = stats.slack,
+        shielded = shielded, hpFrac = hpFrac, approaching = centre > castRange, travel = centre - castRange,
     })
 
     ESP.update(now, stats)
     Bot.refreshUI(now)
+end
+
+-- ---- a report of what the bot sees ----
+
+-- For working out why it misbehaves (a boss it can't attack, a skill it ignores): everything it knows about the npcs, rooms,
+-- skills and attacks, print()ed to the console (F9 / the executor's output) and returned. Run it from the Dump button or
+-- getgenv().__AutoCombat.api.Bot.dump().
+local function describeModel(model)
+    local parts = {}
+    for _, c in ipairs(model:GetChildren()) do
+        local text = c.Name .. ":" .. c.ClassName
+        if c:IsA("ValueBase") then text = text .. "=" .. tostring(c.Value) end
+        table.insert(parts, text)
+        if #parts >= 14 then
+            table.insert(parts, "...")
+            break
+        end
+    end
+    local ok, attrs = pcall(function() return model:GetAttributes() end)
+    if ok and type(attrs) == "table" then
+        for k, v in pairs(attrs) do table.insert(parts, "@" .. tostring(k) .. "=" .. tostring(v)) end
+    end
+    return table.concat(parts, ", ")
+end
+
+function Bot.dump()
+    local out = {}
+    local function add(fmt, ...) table.insert(out, string.format(fmt, ...)) end
+    local now = clock()
+    local me = State.hrp and State.hrp.Position
+
+    add("=== AutoCombat report ===")
+    add("mode %s | enabled %s | kills %d | deaths %d | shield %.1fs | caution +%.1f", State.mode, tostring(State.enabled), State.kills, State.deaths, Hazards.shieldLeft, Hazards.extraPad)
+    if me then add("position %.0f, %.0f, %.0f | walkspeed %.0f | health %.0f/%.0f", me.X, me.Y, me.Z, State.hum.WalkSpeed, State.hum.Health, State.hum.MaxHealth) end
+
+    add("--- skills (stand reach %.0f) ---", Skills.reach)
+    for _, sk in ipairs(Skills.list) do
+        local live = sk.live
+        add("%-22s %-8s reach %3.0f  casts %d hits %d  %s", sk.name, sk.kind, sk.reach, sk.casts, sk.hits,
+            live and (live.ready and "READY" or string.format("%.1fs / %.0fs", live.remaining, live.length)) or "not carried")
+    end
+
+    add("--- rooms ---")
+    for _, r in ipairs(Dungeon.rooms) do
+        local b = Dungeon.boundsOf(r.room)
+        add("%-14s alive %d  %s  %s", r.name, r.alive, Dungeon.cleared[r.room] and "cleared" or "pending",
+            b and string.format("area %.0f x %.0f at (%.0f, %.0f)", b.max.X - b.min.X, b.max.Z - b.min.Z, b.center.X, b.center.Z) or "no parts")
+    end
+
+    add("--- npcs (%d) ---", #Npcs.list)
+    for _, n in ipairs(Npcs.list) do
+        add("%s%s | room %s | width %.0f (radius %.0f) | aggro %s | attackSpeed %s | hp %.0f%% | %s | root %s (%s)",
+            n.boss and "[BOSS] " or "", n.model.Name, n.room.Name, n.width or 0, n.radius, n.aggro and string.format("%.0f", n.aggro) or "-",
+            n.attackSpeed and string.format("%.1f", n.attackSpeed) or "-", n.hp * 100,
+            me and string.format("%.0f studs", flat(me - n.pos).Magnitude) or "?", n.root.Name, n.root.ClassName)
+        add("    %s", describeModel(n.model))
+    end
+
+    add("--- attacks (%d) ---", (function() local k = 0 for _ in pairs(Hazards.active) do k = k + 1 end return k end)())
+    for obj, zone in pairs(Hazards.active) do
+        add("%-8s %s | age %.1fs | size %.0f x %.0f", zone.kind, obj.Name, now - zone.born, zone.size.X, zone.size.Z)
+    end
+    local learned = {}
+    for name in pairs(Hazards.learned) do table.insert(learned, name) end
+    if #learned > 0 then add("learned this run: %s", table.concat(learned, ", ")) end
+
+    local text = table.concat(out, "\n")
+    print(text)
+    Log.add("Report printed to the console")
+    return text
 end
 
 -- ---- startup / shutdown ----
