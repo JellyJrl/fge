@@ -1,25 +1,24 @@
 --[[
-    Auto Combat - dungeon follow / dodge / abilities.
+    Auto Combat - clears a dungeon on its own.
 
-    What the bot does, in priority order:
-      1. Survive   it always knows which attack zones are live or about to fire (parts named "precast" / "hitbox",
-                   orbs, npc-named parts, loose models) and steers out of them in time.
-      2. Engage    it walks to the nearest npc group and stands where its skills reach - and inside the npc's own
-                   `aggroRange`, because an npc ignores anyone outside it (no precasts, nothing to fight).
-      3. Fight     it faces the npcs and uses the buff skill and the attack skill from there.
+    The three jobs, in priority order:
+      1. IDENTIFY   Npcs      who is in the dungeon: name, health, aggro range, attack speed, which room, which group.
+                    Hazards   what is attacking: precast telegraphs, hitboxes, orbs, npc-named parts, loose models -
+                              each with the time window in which it hurts.
+      2. SURVIVE    Planner   a space-time search over the whole arena: every attack at once, each with its own timing,
+                              plus walls and the npcs' own bodies. It finds the quickest way to a spot that stays safe,
+                              and re-plans ten times a second. While nothing threatens us it stays put.
+      3. CLEAR      Dungeon   rooms in order: fight the room's npcs, then walk to the next room, until none are left.
+                    Skills    the buff and the attack skill, used from inside each npc's aggro range (it ignores anyone
+                              outside it - no precasts, nothing to fight).
+
+    Dying less:  attacks are padded more when our health is low, and when something hits us that we didn't see coming;
+                 the part that appeared right before such a hit is remembered (this run only) as an attack.
+                 While fighting one group, the bot stays out of the aggro range of the others.
 
     One file, a few module tables:
-      Util / Log / State          shared helpers
-      Npcs                        the dungeon's enemies: cache, groups, target lock, cast range
-      Hazards                     attack detection and every "is this spot dangerous" question
-      Walls                       raycasts against the map
-      Nav                         movement, facing, path walking, choosing where to stand
-      Skills                      ability detection and casting
-      ESP / UI                    drawing and the control window
-      Bot                         the per-frame loop, respawns, startup and shutdown
-
-    Running the script again stops the previous run first. The running bot is reachable as
-    getgenv().__AutoCombat (stop(), config, ...).
+      Npcs  Dungeon  Hazards  Walls  Planner  Nav  Skills  ESP  UI  Bot
+    Running the script again stops the previous run. The running bot is reachable as getgenv().__AutoCombat.
 ]]
 
 local Players = game:GetService("Players")
@@ -46,42 +45,49 @@ end
 local Config = {
     BOOT_DELAY          = 10,    -- seconds to let the game finish its own setup before we touch anything
 
-    -- ---- where to stand (studs) ----
+    -- ---- fighting distances (studs) ----
     MIN_DISTANCE        = 7,     -- never closer than this to an npc's body
     ATTACK_RANGE        = 90,    -- how far the attack skill is assumed to reach (to an npc's CENTRE); calibrated while fighting
     RANGE_MARGIN        = 6,     -- stand this far inside the cast range
     USE_AGGRO_RANGE     = true,  -- npcs only react to someone inside their `aggroRange`: stand and cast inside it
     AGGRO_MARGIN        = 3,     -- ...this far inside, so we're clearly in it
+    AVOID_OTHER_AGGRO   = true,  -- while fighting one group, stay out of the aggro range of the others (don't wake them)
+    PULL_RANGE          = 60,    -- an npc from another room this close is part of the fight
     BIG_BODY_GAP        = 12,    -- never closer than this to the edge of a huge npc (a boss)
     GROUP_LINK          = 20,    -- npcs this close to each other are one group
     TARGET_SWITCH       = 2,     -- another npc must be this much closer before the target lock moves
     BODY_RADIUS         = 4,     -- an npc this wide counts as a point; only size beyond it adds keep-away distance
     FLANK_RANGE         = 60,
 
-    -- ---- movement ----
-    STEER_RATE          = 0.12,  -- how often the local spot search runs
-    REPATH_RATE         = 0.5,
-    WAYPOINT_REACHED    = 3.5,
-    WAYPOINT_TIMEOUT    = 1.5,
-    STUCK_TIME          = 2.5,
-    STUCK_MOVE          = 0.4,
-    SEARCH_RADII        = { 4, 8, 13, 19, 26, 34 },
-    SEARCH_ANGLE_STEP   = 20,
-    WALL_CHECKS         = 60,    -- how many best-scoring spots get the (expensive) wall test
-    WALL_CLEARANCE      = 5,     -- studs of breathing room we like around a spot
+    -- ---- the dungeon ----
+    ROOM_EMPTY_WAIT     = 5,     -- standing in a room this long without npcs appearing: it was empty, move on
+    ROOM_ARRIVE         = 15,    -- this close to a room's centre = arrived
+    ADVANCE_RETRY       = 10,    -- a room we couldn't reach is retried after this long
+    FINISH_WAIT         = 4,     -- nothing left to do for this long = the dungeon is complete (the next room may still load)
 
-    -- ---- danger ----
+    -- ---- the dodge planner ----
+    GRID                = 3,     -- studs per planning cell
+    PLAN_RADIUS         = 9,     -- cells searched around us (x GRID studs)
+    PLAN_RADIUS_MAX     = 14,    -- ...widened to this when no safe spot is found
+    PLAN_RATE           = 0.1,   -- re-plan this often while threatened
+    HORIZON             = 2.5,   -- how far ahead we look for something that will hit where we stand
+    SETTLE              = 1.5,   -- a spot we stop at must stay safe this long after we arrive
+    NEXT_MIN            = 4.5,   -- head for the first point of the plan this far away (not the very next cell: it would be reached too soon)
+    REACTION            = 0.15,  -- input / humanoid delay added to every travel-time estimate
+    HIT_COST            = 6,     -- walking through a live attack costs this many seconds of walking per cell (never forbidden)
+    PLAN_STICK          = 0.5,   -- a re-plan keeps the previous destination unless another is this many seconds better...
+    PLAN_STICK_RADIUS   = 4.5,   -- ...(destinations this close count as the same)
+
+    -- ---- attacks ----
     PADDING             = 2,     -- margin kept around every attack
+    VERTICAL            = 4,     -- an attack zone also reaches this far above/below its box (our root sits above the floor)
     PRECAST_DELAY       = 2.0,   -- a precast telegraphs ~2s before the spell fires
     PRECAST_SAFETY      = 0.35,  -- want to be out of a precast zone this long BEFORE it fires
-    DODGE_LEAD          = 1.5,   -- start leaving a zone over us once it fires within about this (+ PRECAST_SAFETY) seconds
-    SAFE_WINDOW         = 1.0,   -- a destination must stay safe this long after we get there
-    REACTION            = 0.15,  -- input / humanoid delay added to every travel-time estimate
-    PREDICT_MAX         = 1.2,   -- seconds ahead a MOVING attack is extrapolated (sweeping beams ...)
+    HITBOX_ASSUME       = 1.5,   -- a hitbox of unknown length is assumed to last this much longer (re-assumed every plan)
+    PREDICT_MAX         = 3.0,   -- seconds ahead a MOVING attack is extrapolated (sweeping beams ...), then assumed to stop
     ORB_NAME            = "battlemageorb",
     ORB_PADDING         = 3,
-    ORB_STAY            = 1.0,   -- an orb is dangerous to a spot it passes within this long of when we're there
-    ORB_HORIZON         = 4.0,   -- a spot we will STAY at must be clear of the orb's path this many seconds ahead
+    ORB_HORIZON         = 4.0,   -- an orb is assumed to keep flying this long
     ORB_RECHECK         = 3,     -- an orb's Trail/Mist can appear after the part: re-check top-level parts this long
     MODELS_ARE_ATTACKS  = true,  -- a Model dropped straight into workspace counts as an attack...
     UNKNOWN_MAX_AGE     = 6,     -- ...until it has been around this long: then it was scenery
@@ -92,6 +98,23 @@ local Config = {
     -- Things the bot must never see: no danger zone, no ESP, no UI count, never a wall. Matched against the
     -- normalized name (lowercase letters/digits) of the object AND of everything it sits inside.
     IGNORE_NAMES        = { "groundaura" },
+
+    -- ---- dying less ----
+    CAUTION_HP          = 0.6,   -- below this share of health, attacks are padded more
+    CAUTION_PAD         = 1.5,   -- ...by up to this many studs (at 0 health)
+    SURPRISE_PAD        = 0.5,   -- every hit from something we didn't see pads attacks this much more...
+    SURPRISE_MAX        = 2,     -- ...up to this
+    SURPRISE_DECAY      = 0.05,  -- ...fading by this per second
+    SUSPECT_WINDOW      = 1.5,   -- parts that appeared this recently before an unseen hit are suspects
+    SUSPECT_RADIUS      = 30,    -- ...if they were this close to us
+    SUSPECT_HITS        = 2,     -- a suspect that is near two unseen hits is treated as an attack for the rest of this run
+
+    -- ---- movement ----
+    REPATH_RATE         = 0.5,
+    WAYPOINT_REACHED    = 3.5,
+    WAYPOINT_TIMEOUT    = 1.5,
+    STUCK_TIME          = 2.5,
+    STUCK_MOVE          = 0.4,
 
     -- ---- barriers (some bosses can't be approached) ----
     BARRIER_STUCK       = 6,     -- not moving for this long while trying to walk = something blocks us
@@ -131,8 +154,7 @@ local Config = {
 -- =====================
 -- SHARED: modules, state, helpers
 -- =====================
-local Npcs, Hazards, Walls, Nav, Skills, ESP, UI, Bot = {}, {}, {}, {}, {}, {}, {}, {}
-
+local Npcs, Dungeon, Hazards, Walls, Planner, Nav, Skills, ESP, UI, Bot = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
 local API = {}   -- filled in at the bottom: the modules, reachable as getgenv().__AutoCombat.api
 
 local State = {
@@ -144,7 +166,10 @@ local State = {
     char = nil, hum = nil, hrp = nil,
     wasAlive = true,
     shieldUntil = 0,
-    ignoreDirty = false,   -- ray filter needs a rebuild
+    ignoreDirty = false,   -- the ray filter needs a rebuild
+    kills = 0,
+    deaths = 0,
+    startedAt = 0,
 }
 
 local function flat(v)
@@ -206,16 +231,19 @@ function State.alive()
 end
 
 -- =====================
--- NPCS: the dungeon's enemies
+-- NPCS: who is in the dungeon
 -- workspace.dungeon.<room>.enemyFolder.<npc model>, each with a Humanoid and (usually) numbers describing it:
 --   aggroRange   how close you must be before it reacts (precasts, attacks) at all
 --   attackSpeed  how long its attack sequence (precast + hitbox) lasts
+-- `list` is every living npc; `pool` is the ones we are fighting or heading for right now (see Dungeon.pool).
 -- =====================
-Npcs.list = {}      -- { {model, root, pos, radius, humanoid, key, aggro, attackSpeed, group} }, rebuilt by refresh()
-Npcs.groups = {}    -- { {members, centroid, radius, count} }
+Npcs.list = {}      -- { {model, room, root, pos, radius, humanoid, hp, key, aggro, attackSpeed, group} }
+Npcs.pool = {}      -- the part of `list` the bot is dealing with
+Npcs.groups = {}    -- built from the pool: { {members, centroid, radius, count} }
 Npcs.locked = nil   -- the model we're locked onto
 Npcs.lastRefresh = -math.huge
 Npcs.cache = setmetatable({}, { __mode = "k" })     -- [model] = { root, radius, humanoid, key, t }
+Npcs.seen = setmetatable({}, { __mode = "k" })      -- [model] = true while we know it alive (to count kills)
 -- Precast timing left for the hitbox that follows it. Keyed by npc MODEL, because the entries in `list` are rebuilt
 -- every refresh and anything stored on them would be gone before the hitbox appears.
 Npcs.pending = setmetatable({}, { __mode = "k" })
@@ -269,38 +297,48 @@ function Npcs.info(model, now)
     return info
 end
 
--- Rebuilds the list unless it is younger than `maxAge`. A NEW table every time, so a loop halfway through the old
--- one is never disturbed.
+-- Rebuilds `list` unless it is younger than `maxAge`. A NEW table every time, so a loop halfway through the old
+-- one is never disturbed. Counts the npcs that died since the last rebuild.
 function Npcs.refresh(maxAge)
     local now = clock()
     if now - Npcs.lastRefresh < (maxAge or 0) then return end
     Npcs.lastRefresh = now
 
-    local list = {}
+    local list, aliveNow = {}, {}
     for _, room in ipairs(Npcs.rooms()) do
         local folder = room:FindFirstChild("enemyFolder")
         if folder then
             for _, model in ipairs(folder:GetChildren()) do
                 if model:IsA("Model") then
                     local info = Npcs.info(model, now)
+                    local hum = info and info.humanoid
                     -- a dead npc lingering through its death animation is no longer a target
-                    if info and not (info.humanoid and info.humanoid.Health <= 0) then
+                    if info and not (hum and hum.Health <= 0) then
+                        aliveNow[model] = true
                         table.insert(list, {
-                            model = model, root = info.root, pos = info.root.Position, radius = info.radius,
-                            humanoid = info.humanoid, key = info.key, aggro = info.aggro, attackSpeed = info.attackSpeed,
+                            model = model, room = room, root = info.root, pos = info.root.Position, radius = info.radius,
+                            humanoid = hum, hp = hum and hum.MaxHealth > 0 and math.clamp(hum.Health / hum.MaxHealth, 0, 1) or 1,
+                            key = info.key, aggro = info.aggro, attackSpeed = info.attackSpeed,
                         })
                     end
                 end
             end
         end
     end
+    for model in pairs(Npcs.seen) do
+        if not aliveNow[model] then
+            Npcs.seen[model] = nil
+            State.kills = State.kills + 1
+        end
+    end
+    for model in pairs(aliveNow) do Npcs.seen[model] = true end
     Npcs.list = list
 end
 
--- nearest npc by SURFACE (centre distance minus its extra body radius)
-function Npcs.nearest(pos)
+-- nearest npc of `list` by SURFACE (centre distance minus its extra body radius)
+function Npcs.nearest(pos, list)
     local best, bestDist = nil, math.huge
-    for _, n in ipairs(Npcs.list) do
+    for _, n in ipairs(list) do
         local d = flat(pos - n.pos).Magnitude - n.radius
         if d < bestDist then best, bestDist = n, d end
     end
@@ -309,26 +347,28 @@ end
 
 -- Skills and aggro both reach by distance to an npc's CENTRE: a boss with a massive body looks "close" by its edge
 -- but can still be far out of reach.
-function Npcs.nearestCenter(pos)
+function Npcs.nearestCenter(pos, list)
     local best, bestDist = nil, math.huge
-    for _, n in ipairs(Npcs.list) do
+    for _, n in ipairs(list) do
         local d = flat(pos - n.pos).Magnitude
         if d < bestDist then best, bestDist = n, d end
     end
     return best, bestDist
 end
 
+-- how close we are to ANY npc's body: the keep-away distance applies to all of them, fighting or not
 function Npcs.surfaceDistance(pos)
-    local _, d = Npcs.nearest(pos)
+    local _, d = Npcs.nearest(pos, Npcs.list)
     return d
 end
 
 -- npcs within GROUP_LINK of a group member join it
 function Npcs.buildGroups()
     local groups = {}
-    for _, n in ipairs(Npcs.list) do n.group = nil end
+    local pool = Npcs.pool
+    for _, n in ipairs(pool) do n.group = nil end
 
-    for _, seed in ipairs(Npcs.list) do
+    for _, seed in ipairs(pool) do
         if not seed.group then
             local id = #groups + 1
             local members = { seed }
@@ -337,7 +377,7 @@ function Npcs.buildGroups()
             local i = 1
             while i <= #members do
                 local cur = members[i]
-                for _, other in ipairs(Npcs.list) do
+                for _, other in ipairs(pool) do
                     if not other.group and flat(other.pos - cur.pos).Magnitude - other.radius - cur.radius <= Config.GROUP_LINK then
                         other.group = id
                         table.insert(members, other)
@@ -366,7 +406,7 @@ function Npcs.pick(nearest, nearestDist, me)
         return nil
     end
     if Npcs.locked then
-        for _, n in ipairs(Npcs.list) do
+        for _, n in ipairs(Npcs.pool) do
             if n.model == Npcs.locked then
                 if flat(me - n.pos).Magnitude - n.radius <= nearestDist + Config.TARGET_SWITCH then
                     return n
@@ -463,12 +503,189 @@ function Npcs.takePending(attackName, pos, now)
 end
 
 -- =====================
--- HAZARDS: attack zones, and every "is this spot dangerous" question
---   precast  telegraph; fires PRECAST_DELAY seconds after it appears
---   hitbox   active now (its duration is worked out so it becomes safe to cross once over)
---   orb      a moving part (battleMageOrb), recognised by name or by its Trail / Attachment / Mist
---   unknown  a loose Model dropped into workspace: a possible attack until it has been around too long
--- Each zone's geometry (cf / size / pos / velocity) is read once per frame by update() and reused by every query.
+-- DUNGEON: the rooms, in order, and how far through them we are
+-- workspace.dungeon.<room>.enemyFolder. Rooms are taken in name order (room1, room2, ... room10): the first one that still
+-- has living npcs is the one being fought; when none has, the first one not yet cleared is where to walk next; when
+-- every room is cleared the dungeon is finished.
+--   cleared   a room that had npcs and now has none, or one we stood in for ROOM_EMPTY_WAIT seconds that never had any
+-- =====================
+Dungeon.rooms = {}                                   -- sorted: { room, name, alive }
+Dungeon.cleared = setmetatable({}, { __mode = "k" })  -- [room] = true
+Dungeon.hadNpcs = setmetatable({}, { __mode = "k" })  -- [room] = true once npcs were seen in it
+Dungeon.enteredAt = setmetatable({}, { __mode = "k" }) -- [room] = when we started standing in it (while it had no npcs)
+Dungeon.blocked = setmetatable({}, { __mode = "k" })  -- [room] = when it may be tried again (we couldn't reach it)
+Dungeon.bounds = setmetatable({}, { __mode = "k" })   -- [room] = { min, max, center, t }
+Dungeon.finished = false
+Dungeon.quietSince = nil                              -- since when nothing was left to do
+Dungeon.lastRefresh = -math.huge
+
+local function sortKey(name)
+    local text, num = name:lower():match("^(%D*)(%d*)")
+    return text or "", tonumber(num) or math.huge
+end
+
+local function roomLess(a, b)
+    local ta, na = sortKey(a.name)
+    local tb, nb = sortKey(b.name)
+    if ta ~= tb then return ta < tb end
+    if na ~= nb then return na < nb end
+    return a.name < b.name
+end
+
+local function inEnemyFolder(part, room)
+    local p = part.Parent
+    while p and p ~= room do
+        if p.Name == "enemyFolder" then return true end
+        p = p.Parent
+    end
+    return false
+end
+
+-- the area a room covers (its parts, not its npcs), measured once in a while
+function Dungeon.boundsOf(room)
+    local b = Dungeon.bounds[room]
+    if b and clock() - b.t < 10 then return b end
+
+    local lo, hi
+    for _, d in ipairs(room:GetDescendants()) do
+        if d:IsA("BasePart") and not inEnemyFolder(d, room) then
+            local half = d.Size / 2
+            local a, c = d.Position - half, d.Position + half
+            lo = lo and Vector3.new(math.min(lo.X, a.X), math.min(lo.Y, a.Y), math.min(lo.Z, a.Z)) or a
+            hi = hi and Vector3.new(math.max(hi.X, c.X), math.max(hi.Y, c.Y), math.max(hi.Z, c.Z)) or c
+        end
+    end
+    if not lo then return nil end
+    b = { min = lo, max = hi, center = (lo + hi) / 2, t = clock() }
+    Dungeon.bounds[room] = b
+    return b
+end
+
+function Dungeon.inside(room, pos)
+    local b = Dungeon.boundsOf(room)
+    return b ~= nil and pos.X >= b.min.X - 5 and pos.X <= b.max.X + 5 and pos.Z >= b.min.Z - 5 and pos.Z <= b.max.Z + 5
+end
+
+-- Re-reads the rooms and decides which are cleared. Twice a second is plenty.
+function Dungeon.refresh(now, me)
+    if now - Dungeon.lastRefresh < 0.5 then return end
+    Dungeon.lastRefresh = now
+
+    local counts = {}
+    for _, n in ipairs(Npcs.list) do counts[n.room] = (counts[n.room] or 0) + 1 end
+
+    local rooms = {}
+    for _, room in ipairs(Npcs.rooms()) do
+        if room:FindFirstChild("enemyFolder") then
+            table.insert(rooms, { room = room, name = room.Name, alive = counts[room] or 0 })
+        end
+    end
+    table.sort(rooms, roomLess)
+    Dungeon.rooms = rooms
+
+    for _, r in ipairs(rooms) do
+        local room = r.room
+        if r.alive > 0 then
+            if not Dungeon.hadNpcs[room] then Log.add("Room " .. r.name .. ": " .. r.alive .. " npc(s)") end
+            Dungeon.hadNpcs[room] = true
+            Dungeon.cleared[room] = nil   -- (a new wave reopens it)
+            Dungeon.enteredAt[room] = nil
+        elseif not Dungeon.cleared[room] then
+            if Dungeon.hadNpcs[room] then
+                Dungeon.cleared[room] = true
+                Log.add("Room " .. r.name .. " cleared")
+            elseif me and Dungeon.inside(room, me) then
+                -- standing in a room that never had npcs: give them a moment to spawn, then move on
+                Dungeon.enteredAt[room] = Dungeon.enteredAt[room] or now
+                if now - Dungeon.enteredAt[room] >= Config.ROOM_EMPTY_WAIT then
+                    Dungeon.cleared[room] = true
+                    Log.add("Room " .. r.name .. " is empty")
+                end
+            else
+                Dungeon.enteredAt[room] = nil
+            end
+        end
+    end
+
+    -- finished: there are rooms, nothing is left (nor any room we haven't done), and it stays that way for FINISH_WAIT
+    -- seconds (the next room may only be built once this one is cleared)
+    local pending = false
+    for _, r in ipairs(rooms) do
+        if r.alive > 0 or not Dungeon.cleared[r.room] then pending = true end
+    end
+    if #rooms > 0 and not pending then
+        Dungeon.quietSince = Dungeon.quietSince or now
+    else
+        Dungeon.quietSince = nil
+    end
+    local finished = Dungeon.quietSince ~= nil and now - Dungeon.quietSince >= Config.FINISH_WAIT
+    if finished and not Dungeon.finished then
+        Log.add(string.format("Dungeon complete: %d npcs killed, %d death(s), %.0fs", State.kills, State.deaths, clock() - State.startedAt))
+    end
+    Dungeon.finished = finished
+end
+
+-- the room being fought: the first (in order) with living npcs
+function Dungeon.active()
+    for _, r in ipairs(Dungeon.rooms) do
+        if r.alive > 0 then return r end
+    end
+    return nil
+end
+
+-- where to walk when nothing is alive: the first room not yet cleared (and not one we gave up on for now)
+function Dungeon.next(now)
+    for _, r in ipairs(Dungeon.rooms) do
+        if r.alive == 0 and not Dungeon.cleared[r.room] and now >= (Dungeon.blocked[r.room] or 0) then
+            return r
+        end
+    end
+    return nil
+end
+
+-- a floor point in the middle of a room (the centre of its box, dropped onto the ground)
+function Dungeon.goal(r)
+    local b = Dungeon.boundsOf(r.room)
+    if not b then return nil end
+    local hit = Walls.cast(Vector3.new(b.center.X, b.max.Y + 50, b.center.Z), Vector3.new(0, -(b.max.Y - b.min.Y) - 300, 0))
+    return hit and (hit.Position + Vector3.new(0, 3, 0)) or b.center
+end
+
+-- the npcs the bot is dealing with: the active room's, plus any from other rooms that are close enough to be part of
+-- the fight (they have noticed us, or are about to)
+function Dungeon.pool(list, me)
+    local active = Dungeon.active()
+    if not active then return list end
+    local pool = {}
+    for _, n in ipairs(list) do
+        if n.room == active.room then
+            table.insert(pool, n)
+        else
+            local surface = flat(me - n.pos).Magnitude - n.radius
+            if surface <= math.max(n.aggro or 0, Config.PULL_RANGE) then table.insert(pool, n) end
+        end
+    end
+    return pool
+end
+
+-- "3/8" style summary for the UI: rooms cleared / rooms
+function Dungeon.progress()
+    local done = 0
+    for _, r in ipairs(Dungeon.rooms) do
+        if Dungeon.cleared[r.room] then done = done + 1 end
+    end
+    return done, #Dungeon.rooms
+end
+
+-- =====================
+-- HAZARDS: what is attacking, and WHEN it hurts
+--   precast  telegraph; fires PRECAST_DELAY seconds after it appears (from then on the same area is a hitbox)
+--   hitbox   active now (its length is worked out when the game says; otherwise assumed HITBOX_ASSUME at a time)
+--   orb      a moving part, recognised by name or by its Trail / Attachment / Mist
+--   unknown  a loose Model dropped into workspace, or a part blamed for an unseen hit: dangerous until proven scenery
+-- Every zone has a time window [on, off] (seconds from now) in which it is dangerous, and a shape at each moment in it.
+-- ONE question is asked about all of them - "does this zone occupy this point during [t0, t1]?" - by the planner and by
+-- every check, so they can never disagree. A zone's geometry is read once per frame by update().
 -- =====================
 Hazards.COLORS = {
     precast = Color3.fromRGB(255, 170, 0),
@@ -486,6 +703,24 @@ Hazards.hidden = setmetatable({}, { __mode = "k" })    -- objects on the ignore 
 Hazards.nameCache = {}                                 -- raw name -> on the ignore list?
 Hazards.nameCount = 0
 Hazards.lastScan = 0
+
+-- dying less: padding grows with low health and with hits we didn't see coming (this run only, never saved)
+Hazards.extraPad = 0
+Hazards.surprise = 0
+Hazards.recent = {}      -- parts that just appeared: { name, raw, pos, t } - suspects when something unseen hits us
+Hazards.suspects = {}    -- [normalized name] = unseen hits it was near
+Hazards.learned = {}     -- [normalized name] = true: treated as an attack for the rest of this run
+
+function Hazards.pad()
+    return Config.PADDING + Hazards.extraPad
+end
+
+-- hp = share of health left; dt = seconds since the last call
+function Hazards.setCaution(hp, dt)
+    Hazards.surprise = math.max(0, Hazards.surprise - Config.SURPRISE_DECAY * dt)
+    local low = math.clamp((Config.CAUTION_HP - hp) / Config.CAUTION_HP, 0, 1) * Config.CAUTION_PAD
+    Hazards.extraPad = low + Hazards.surprise
+end
 
 -- ---- the ignore list (ground aura ...) ----
 
@@ -553,10 +788,11 @@ end
 
 function Hazards.kindOf(obj)
     local name = normalize(obj.Name)
+    if Hazards.learned[name] then return "hitbox" end   -- blamed for hits we didn't see coming (this run)
     if name:find("precast", 1, true) then return "precast" end
     if name:find("hitbox", 1, true) then return "hitbox" end
 
-    -- Beyond the two names above, only parts sitting directly in workspace are considered: permanent scenery lives
+    -- Beyond the names above, only parts sitting directly in workspace are considered: permanent scenery lives
     -- inside a container, real attacks are created fresh and destroyed once they end.
     if obj.Parent ~= workspace then return nil end
 
@@ -633,7 +869,7 @@ function Hazards.resolve(zone, now)
         return true
     end
 
-    if now - zone.born > 2 then zone.gaveUp = true end   -- nothing found: dangerous for as long as it exists
+    if now - zone.born > 2 then zone.gaveUp = true end   -- nothing found: assumed HITBOX_ASSUME at a time
     return false
 end
 
@@ -824,12 +1060,23 @@ function Hazards.scan(now)
     end
 end
 
+-- remembered for a moment: if something we never saw coming hits us, one of these is probably it
+function Hazards.noteRecent(obj)
+    if obj.Name:sub(1, 1) == "_" or Hazards.active[obj] or Hazards.isIgnored(obj) or Hazards.inCharacter(obj) then return end
+    table.insert(Hazards.recent, { name = normalize(obj.Name), raw = obj.Name, pos = obj.Position, t = clock() })
+    if #Hazards.recent > 60 then table.remove(Hazards.recent, 1) end
+end
+
 function Hazards.onAdded(obj)
     if obj:IsA("BasePart") then
         Hazards.add(obj, nil, true)
+        Hazards.noteRecent(obj)
     elseif obj:IsA("Model") or obj:IsA("Folder") then
         for _, d in ipairs(obj:GetDescendants()) do
-            if d:IsA("BasePart") then Hazards.add(d, nil, true) end
+            if d:IsA("BasePart") then
+                Hazards.add(d, nil, true)
+                Hazards.noteRecent(d)
+            end
         end
         if obj:IsA("Model") then Hazards.addModel(obj) end
     end
@@ -845,7 +1092,29 @@ function Hazards.start()
     end))
 end
 
--- ---- danger queries ----
+-- We were hit and no zone explains it. Every part that appeared near us just before is a suspect; one that is near two
+-- such hits is treated as an attack for the rest of this run. Returns the suspects' names (for the log).
+function Hazards.blame(pos)
+    local now = clock()
+    local names, order, seen = {}, {}, {}
+    for _, r in ipairs(Hazards.recent) do
+        if now - r.t <= Config.SUSPECT_WINDOW and flat(pos - r.pos).Magnitude <= Config.SUSPECT_RADIUS
+            and not seen[r.name] and not Hazards.learned[r.name] then
+            seen[r.name] = true
+            table.insert(order, r.raw)
+            Hazards.suspects[r.name] = (Hazards.suspects[r.name] or 0) + 1
+            if Hazards.suspects[r.name] >= Config.SUSPECT_HITS then
+                Hazards.learned[r.name] = true
+                Hazards.skip = setmetatable({}, { __mode = "k" })   -- everything gets a fresh look under the new name
+                Log.add("Learned attack (this run): " .. r.raw)
+            end
+        end
+    end
+    Hazards.surprise = math.min(Config.SURPRISE_MAX, Hazards.surprise + Config.SURPRISE_PAD)
+    return order
+end
+
+-- ---- when does it hurt? ----
 
 -- seconds until the zone becomes harmful (0 = harmful right now)
 function Hazards.timeToFire(zone, now)
@@ -855,12 +1124,31 @@ function Hazards.timeToFire(zone, now)
     return 0
 end
 
--- seconds until an active zone stops being dangerous (math.huge = unknown: dangerous while it exists)
-function Hazards.timeToEnd(zone, now)
-    if zone.duration then
-        return math.max(0, zone.duration - (now - zone.born))
+-- The time window [on, off] (seconds from now) in which the zone is dangerous. A precast is dangerous from just before
+-- it fires (PRECAST_SAFETY) for as long as it lasts (the hitbox that replaces it covers the same ground).
+function Hazards.window(zone, now)
+    local age = now - zone.born
+    if zone.kind == "precast" then
+        return math.max(0, Config.PRECAST_DELAY - age - Config.PRECAST_SAFETY), math.huge
+    elseif zone.kind == "hitbox" then
+        if zone.duration then
+            return 0, math.max(0, zone.duration - age) + Config.PRECAST_SAFETY
+        end
+        return 0, Config.HITBOX_ASSUME
+    elseif zone.kind == "orb" then
+        return 0, Config.ORB_HORIZON
     end
-    return math.huge
+    return 0, math.max(0, Config.UNKNOWN_MAX_AGE - age)
+end
+
+-- every zone with its window, for a batch of questions at one moment (the planner asks thousands)
+function Hazards.windows(now)
+    local list = {}
+    for _, zone in pairs(Hazards.active) do
+        local on, off = Hazards.window(zone, now)
+        table.insert(list, { zone = zone, on = on, off = off })
+    end
+    return list
 end
 
 -- Flat distance from `pos` to the path an orb sweeps between t0 and t1 seconds from now. Orbs are judged by WHERE THEY
@@ -876,97 +1164,92 @@ local function orbDistance(zone, pos, t0, t1)
     return (p - (a + ab * u)).Magnitude
 end
 
--- the part of an orb's flight that matters: when we're only passing through (t = when), or when we'll stay at the spot
--- (settle, or t = inf): everything from now until ORB_HORIZON
-local function orbWindow(t, settle)
-    if settle or t == math.huge then return 0, Config.ORB_HORIZON end
-    local t0 = math.max(t or 0, 0)
-    return t0, t0 + Config.ORB_STAY
+-- Does the segment (u0,w0)-(u1,w1) touch the box [-hx,hx] x [-hz,hz]? (slab method)
+function Hazards.segBox(u0, w0, u1, w1, hx, hz)
+    local lo, hi = 0, 1
+    local du, dw = u1 - u0, w1 - w0
+    if du > -1e-9 and du < 1e-9 then
+        if u0 < -hx or u0 > hx then return false end
+    else
+        local ta, tb = (-hx - u0) / du, (hx - u0) / du
+        if ta > tb then ta, tb = tb, ta end
+        if ta > lo then lo = ta end
+        if tb < hi then hi = tb end
+        if lo > hi then return false end
+    end
+    if dw > -1e-9 and dw < 1e-9 then
+        if w0 < -hz or w0 > hz then return false end
+    else
+        local ta, tb = (-hz - w0) / dw, (hz - w0) / dw
+        if ta > tb then ta, tb = tb, ta end
+        if ta > lo then lo = ta end
+        if tb < hi then hi = tb end
+        if lo > hi then return false end
+    end
+    return true
 end
 
--- Is `pos` inside this zone, with `pad` studs of margin? `t` = seconds from now (a moving zone is shifted to where it
--- will be by then; an orb is judged at that time, see orbWindow).
-function Hazards.contains(zone, pos, pad, t, settle)
-    pad = pad or Config.PADDING
+-- Does this zone (dangerous during [on, off]) occupy `pos` at any moment in [t0, t1]?
+-- A MOVING zone (a sweeping beam) slides over the ground meanwhile, so the question is whether the spot's path through
+-- the zone's own frame - the spot moves the opposite way - touches the zone. (A moving zone is extrapolated at most
+-- PREDICT_MAX seconds ahead; after that it is assumed to stop.)
+function Hazards.occupies(zone, on, off, pos, t0, t1, pad)
+    local a, b = math.max(t0, on), math.min(t1, off)
+    if a > b then return false end
+    pad = pad or Hazards.pad()
+
     if zone.kind == "orb" then
-        local t0, t1 = orbWindow(t, settle)
-        return orbDistance(zone, pos, t0, t1) <= zone.radius - math.max(0, Config.PADDING - pad)
+        return orbDistance(zone, pos, a, b) <= zone.radius + (pad - Config.PADDING)
     end
-    local p = pos
-    if t and t > 0 and zone.moving then
-        p = pos - zone.vel * math.min(t, Config.PREDICT_MAX)   -- same as moving the zone forward
-    end
-    local l = zone.cf:PointToObjectSpace(p)
     local half = zone.size / 2
-    return math.abs(l.X) <= half.X + pad and math.abs(l.Y) <= half.Y + pad and math.abs(l.Z) <= half.Z + pad
+    if zone.moving then
+        local a2, b2 = math.min(a, Config.PREDICT_MAX), math.min(b, Config.PREDICT_MAX)
+        local l0 = zone.cf:PointToObjectSpace(pos - zone.vel * a2)
+        local l1 = zone.cf:PointToObjectSpace(pos - zone.vel * b2)
+        return math.abs((l0.Y + l1.Y) / 2) <= half.Y + pad + Config.VERTICAL
+            and Hazards.segBox(l0.X, l0.Z, l1.X, l1.Z, half.X + pad, half.Z + pad)
+    end
+    local l = zone.cf:PointToObjectSpace(pos)
+    return math.abs(l.X) <= half.X + pad and math.abs(l.Z) <= half.Z + pad and math.abs(l.Y) <= half.Y + pad + Config.VERTICAL
 end
 
--- Would standing at `pos` t seconds from now be inside a zone that is active by then? (a precast we can cross and
--- leave before it fires does NOT count; neither does a hitbox that will have ended). `settle` = we'll stay there.
-function Hazards.dangerAt(pos, t, pad, settle)
-    local now = clock()
-    for _, zone in pairs(Hazards.active) do
-        if zone.kind == "precast" and t < Hazards.timeToFire(zone, now) - Config.PRECAST_SAFETY then
-            -- not active yet by the time we'd be there
-        elseif zone.kind ~= "orb" and t < math.huge and zone.duration
-            and t >= Hazards.timeToEnd(zone, now) + Config.PRECAST_SAFETY then
-            -- over by the time we'd be there
-        else
-            if Hazards.contains(zone, pos, pad, t, settle) then return true end
-            -- a destination (t = inf) must also survive a moving zone sweeping across it
-            if (t == math.huge or settle) and zone.moving and zone.kind ~= "orb"
-                and (Hazards.contains(zone, pos, pad, Config.PREDICT_MAX * 0.5) or Hazards.contains(zone, pos, pad, 0)) then
-                return true
-            end
-        end
+-- does any zone of a windows() list occupy `pos` during [t0, t1]?
+function Hazards.hitWin(list, pos, t0, t1, pad)
+    for _, w in ipairs(list) do
+        if Hazards.occupies(w.zone, w.on, w.off, pos, t0, t1, pad) then return true end
     end
     return false
 end
 
-function Hazards.dangerNow(pos, pad) return Hazards.dangerAt(pos, 0, pad) end                              -- hit within the next second?
-function Hazards.destinationDanger(pos, pad) return Hazards.dangerAt(pos, Config.SAFE_WINDOW, pad, true) end -- a spot to settle at
-function Hazards.insideAny(pos, pad) return Hazards.dangerAt(pos, math.huge, pad) end                      -- a spot to sit at for long
-
--- Do we need to dodge? Something hits where we stand within a second, or a precast / a further-off orb is coming
--- (DODGE_LEAD ahead): leaving early costs nothing.
-function Hazards.threatened(pos)
-    return Hazards.dangerAt(pos, 0) or Hazards.dangerAt(pos, Config.DODGE_LEAD)
-end
-
--- samples along a->b that would be inside an active zone when we get there
-function Hazards.routeDanger(a, b, speed, pad)
-    local dist = flat(b - a).Magnitude
-    local steps = math.clamp(math.ceil(dist / 3), 3, 10)   -- a sample every ~3 studs, so a thin beam can't slip between
-    local n = 0
-    for i = 1, steps do
-        local f = i / steps
-        if Hazards.dangerAt(a:Lerp(b, f), (dist * f) / speed + Config.REACTION, pad) then n = n + 1 end
-    end
-    return n
-end
-
--- time until we're out of every zone when walking a->b
-function Hazards.exitTime(a, b, speed, pad)
-    local dist = flat(b - a).Magnitude
-    for i = 1, 8 do
-        if not Hazards.insideAny(a:Lerp(b, i / 8), pad) then
-            return (dist * i / 8) / speed + Config.REACTION
+-- The first moment within `horizon` seconds at which something hits `pos` if we stand there (math.huge = nothing does).
+function Hazards.firstHitWin(list, pos, horizon, pad)
+    local best = math.huge
+    for _, w in ipairs(list) do
+        local start = w.on
+        if start <= horizon and w.off >= 0 then
+            local z = w.zone
+            if z.kind == "orb" or z.moving then
+                local t, last = start, math.min(w.off, horizon)
+                while t <= last do
+                    if Hazards.occupies(z, w.on, w.off, pos, t, t + 0.1, pad) then
+                        best = math.min(best, t)
+                        break
+                    end
+                    t = t + 0.1
+                end
+            elseif Hazards.occupies(z, w.on, w.off, pos, start, start, pad) then
+                best = math.min(best, start)
+            end
         end
     end
-    return dist / speed + Config.REACTION
+    return best
 end
 
--- seconds until the soonest zone containing `pos` fires (0 = already harmful, inf = not inside any)
-function Hazards.deadline(pos)
-    local now = clock()
-    local d = math.huge
-    for _, zone in pairs(Hazards.active) do
-        if Hazards.contains(zone, pos) then d = math.min(d, Hazards.timeToFire(zone, now)) end
-    end
-    return d
+function Hazards.firstHit(pos, horizon, pad)
+    return Hazards.firstHitWin(Hazards.windows(clock()), pos, horizon or Config.HORIZON, pad)
 end
 
--- studs between `pos` and the edge of ONE zone (0 = inside)
+-- studs between `pos` and the edge of ONE zone (0 = inside); orbs by their whole future path
 function Hazards.zoneClearance(zone, pos, pad)
     if zone.kind == "orb" then
         return math.max(0, orbDistance(zone, pos, 0, Config.ORB_HORIZON) - zone.radius)
@@ -975,20 +1258,12 @@ function Hazards.zoneClearance(zone, pos, pad)
     local l = zone.cf:PointToObjectSpace(pos)
     local half = zone.size / 2
     local dx = math.max(math.abs(l.X) - (half.X + pad), 0)
-    local dy = math.max(math.abs(l.Y) - (half.Y + pad), 0)
+    local dy = math.max(math.abs(l.Y) - (half.Y + pad + Config.VERTICAL), 0)
     local dz = math.max(math.abs(l.Z) - (half.Z + pad), 0)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
--- studs to the edge of the NEAREST zone (0 = inside one, huge = none around)
-function Hazards.clearance(pos, pad)
-    local best = math.huge
-    for _, zone in pairs(Hazards.active) do
-        best = math.min(best, Hazards.zoneClearance(zone, pos, pad))
-    end
-    return best
-end
-
+-- how many attacks are within `radius` studs of `pos`
 function Hazards.nearby(pos, radius)
     local n = 0
     for _, zone in pairs(Hazards.active) do
@@ -1099,20 +1374,322 @@ function Walls.moveClear(a, b)
     return Walls.floorBelow(b)
 end
 
--- 0 = open space, higher = closer to walls on more sides (avoids corner traps)
-function Walls.penalty(pos)
-    local pen = 0
-    for _, d in ipairs(Walls.DIRS) do
-        local hit = Walls.cast(pos, d * Config.WALL_CLEARANCE)
-        if hit then pen = pen + (Config.WALL_CLEARANCE - hit.Distance) / Config.WALL_CLEARANCE end
+-- the cheap test the planner makes for every step between neighbouring cells: one ray along the step at body height, and
+-- floor under the end
+function Walls.stepClear(a, b)
+    if Walls.cast(a + Vector3.new(0, 1, 0), b - a) then return false end
+    return Walls.floorBelow(b)
+end
+-- =====================
+-- PLANNER: where to be, and how to get there without being hit
+-- The arena is cut into GRID-stud cells. A search spreads out from where we stand in order of cost - ARRIVAL TIME (we
+-- walk at WalkSpeed) plus HIT_COST for every cell entered while an attack occupies it. Every attack has its own time
+-- window (a precast is harmless until just before it fires, an orb is where it will be then, a sweeping beam is swept
+-- along its path, a hitbox ends when it ends), so a cell is only "hit" if an attack is really there while we pass.
+-- Walking THROUGH an attack is allowed but dear: when we are already inside one (the middle of two crossing lines) the
+-- cheapest way out is found instead of none.
+-- A cell is a place to STOP only if it stays safe for SETTLE seconds after we arrive, keeps clear of the npcs' bodies
+-- and suits the fight (the caller's `penalty`). The best stopping place - quickest to reach, plus its penalty - wins,
+-- and its path is the answer. Many attacks at once, crossing each other, are just more things the search gets around.
+-- The attacks are compiled to plain numbers first, so the thousands of questions are cheap.
+-- =====================
+local G = Config.GRID
+local PM = Config.PREDICT_MAX
+local segBox = Hazards.segBox
+
+Planner.edges = {}        -- [fromKey][toKey] = { ok, t }: walls don't move, so "can I step from here to there" is remembered
+Planner.edgeCount = 0
+Planner.last = nil        -- the last plan: { path, arrival, safe, slack, visited }
+Planner.lastGoal = nil    -- where it ended, and when it was made (the next plan leans toward the same place)
+Planner.lastAt = -math.huge
+
+local DIRS = {}
+for dx = -1, 1 do
+    for dz = -1, 1 do
+        if dx ~= 0 or dz ~= 0 then table.insert(DIRS, { dx, dz, math.sqrt(dx * dx + dz * dz) }) end
     end
-    return pen
+end
+
+local function cellOf(p) return math.floor(p.X / G + 0.5), math.floor(p.Z / G + 0.5) end
+local function keyOf(cx, cz) return (cx + 8192) * 16384 + (cz + 8192) end
+
+-- a binary min-heap on `cost`
+local function heapPush(h, item)
+    local n = #h + 1
+    h[n] = item
+    while n > 1 do
+        local p = math.floor(n / 2)
+        if h[p].cost <= h[n].cost then break end
+        h[p], h[n] = h[n], h[p]
+        n = p
+    end
+end
+
+local function heapPop(h)
+    local top = h[1]
+    local last = table.remove(h)
+    local n = #h
+    if n > 0 then
+        h[1] = last
+        local i = 1
+        while true do
+            local l, r, s = i * 2, i * 2 + 1, i
+            if l <= n and h[l].cost < h[s].cost then s = l end
+            if r <= n and h[r].cost < h[s].cost then s = r end
+            if s == i then break end
+            h[i], h[s] = h[s], h[i]
+            i = s
+        end
+    end
+    return top
+end
+
+-- Attacks as plain numbers, keeping only those that can matter within `reach` studs of `from` in the next `horizon`
+-- seconds. Each is { on, off, ... } plus an orb's path or a box's centre / axes / half extents (already padded).
+local function compile(wins, from, pad, horizon, reach)
+    local out = {}
+    for _, w in ipairs(wins) do
+        local z = w.zone
+        if w.on <= horizon and w.off >= 0 then
+            if z.kind == "orb" then
+                local v = z.flatVel
+                local a = flat(z.pos)
+                local span = math.min(w.off, horizon + Config.SETTLE)
+                local e = a + v * span
+                -- the closest the orb's path comes to us, against what it could reach
+                local ab = e - a
+                local p = flat(from) - a
+                local len2 = ab:Dot(ab)
+                local u = len2 > 0.001 and math.clamp(p:Dot(ab) / len2, 0, 1) or 0
+                local r = z.radius + (pad - Config.PADDING)
+                if (p - ab * u).Magnitude <= reach + r then
+                    table.insert(out, { orb = true, on = w.on, off = w.off, ax = a.X, az = a.Z, vx = v.X, vz = v.Z, r2 = r * r })
+                end
+            else
+                local cf, half = z.cf, z.size / 2
+                if math.abs(from.Y - cf.Position.Y) <= half.Y + pad + Config.VERTICAL then
+                    local rv, lv = cf.RightVector, cf.LookVector
+                    local rl = math.sqrt(rv.X * rv.X + rv.Z * rv.Z)
+                    local ll = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
+                    if rl > 0.01 and ll > 0.01 then
+                        local reachBox = math.max(half.X, half.Z) * 1.5 + pad + (z.moving and flat(z.vel).Magnitude * PM or 0)
+                        if flat(cf.Position - from).Magnitude <= reach + reachBox then
+                            table.insert(out, {
+                                on = w.on, off = w.off, moving = z.moving,
+                                cx = cf.Position.X, cz = cf.Position.Z,
+                                rx = rv.X / rl, rz = rv.Z / rl, lx = lv.X / ll, lz = lv.Z / ll,
+                                hx = half.X + pad, hz = half.Z + pad, vx = z.vel.X, vz = z.vel.Z,
+                            })
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- does any compiled attack occupy (x, z) at some moment in [t0, t1]?
+local function hitAt(list, x, z, t0, t1)
+    for i = 1, #list do
+        local h = list[i]
+        local a = t0 > h.on and t0 or h.on
+        local b = t1 < h.off and t1 or h.off
+        if a <= b then
+            if h.orb then
+                local sx, sz = h.ax + h.vx * a, h.az + h.vz * a
+                local ex, ez = (b - a) * h.vx, (b - a) * h.vz
+                local px, pz = x - sx, z - sz
+                local len2 = ex * ex + ez * ez
+                local u = 0
+                if len2 > 0.001 then
+                    u = (px * ex + pz * ez) / len2
+                    if u < 0 then u = 0 elseif u > 1 then u = 1 end
+                end
+                local dx, dz = px - ex * u, pz - ez * u
+                if dx * dx + dz * dz <= h.r2 then return true end
+            else
+                if h.moving then   -- the spot's path through the box's own frame (see Hazards.occupies)
+                    local a2, b2 = a < PM and a or PM, b < PM and b or PM
+                    local dx0, dz0 = x - h.vx * a2 - h.cx, z - h.vz * a2 - h.cz
+                    local dx1, dz1 = x - h.vx * b2 - h.cx, z - h.vz * b2 - h.cz
+                    if segBox(dx0 * h.rx + dz0 * h.rz, dx0 * h.lx + dz0 * h.lz, dx1 * h.rx + dz1 * h.rz, dx1 * h.lx + dz1 * h.lz, h.hx, h.hz) then return true end
+                else
+                    local dx, dz = x - h.cx, z - h.cz
+                    local lx = dx * h.rx + dz * h.rz
+                    local lz = dx * h.lx + dz * h.lz
+                    if lx <= h.hx and lx >= -h.hx and lz <= h.hz and lz >= -h.hz then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- can we step between two neighbouring cells? (remembered)
+function Planner.stepOk(ax, az, bx, bz, apos, bpos, now)
+    local ka, kb = keyOf(ax, az), keyOf(bx, bz)
+    local row = Planner.edges[ka]
+    if not row then
+        row = {}
+        Planner.edges[ka] = row
+    end
+    local e = row[kb]
+    if e and now - e.t < 30 then return e.ok end
+
+    local ok = Walls.stepClear(apos, bpos)
+    row[kb] = { ok = ok, t = now }
+    Planner.edgeCount = Planner.edgeCount + 1
+    if Planner.edgeCount > 30000 then   -- a very long dungeon: start over rather than grow without end
+        Planner.edges, Planner.edgeCount = {}, 0
+    end
+    return ok
+end
+
+-- a step turned out to be blocked after all (the full body check failed): remember it
+function Planner.blockStep(a, b)
+    local ax, az = cellOf(a)
+    local bx, bz = cellOf(b)
+    local ka, kb = keyOf(ax, az), keyOf(bx, bz)
+    Planner.edges[ka] = Planner.edges[ka] or {}
+    Planner.edges[ka][kb] = { ok = false, t = clock() }
+end
+
+-- Which point of the path to head for. The very next cell centre is too close (reached before the next plan, so the bot
+-- would stand still waiting for it); the first point NEXT_MIN studs away is better, but only if the straight line to it
+-- stays clear of every attack in the times we'd be passing - otherwise fall back toward the next cell.
+local function lookahead(list, path, speed)
+    local from = path[1]
+    local chosen = path[2]
+    for k = 2, #path do
+        local target = path[k]
+        local dx, dz = target.X - from.X, target.Z - from.Z
+        local d = math.sqrt(dx * dx + dz * dz)
+        local ok = true
+        local steps = math.max(1, math.floor(d / 1.5))
+        for i = 1, steps do
+            local f = i / steps
+            local t = Config.REACTION + d * f / speed
+            if hitAt(list, from.X + dx * f, from.Z + dz * f, t - 0.1, t + 0.1) then
+                ok = false
+                break
+            end
+        end
+        if not ok then break end
+        chosen = target
+        if d >= Config.NEXT_MIN then break end
+    end
+    return chosen
+end
+
+-- opts: from, speed, windows (Hazards.windows), penalty(pos) -> extra seconds-equivalent cost of stopping there,
+--       radius (cells). Returns { path = {Vector3...}, arrival, safe, slack, visited } or nil.
+function Planner.plan(opts)
+    local from, speed, now = opts.from, opts.speed, clock()
+    local R = opts.radius or Config.PLAN_RADIUS
+    local pad = Hazards.pad()
+    local settle = Config.SETTLE
+    local penalty = opts.penalty
+    local list = compile(opts.windows, from, pad, settle + Config.HORIZON, R * G + 6)
+    local y = from.Y
+
+    local startSurface = Npcs.surfaceDistance(from)
+    local transitFloor = math.min(Config.MIN_DISTANCE, startSurface) - 0.1   -- never deeper into an npc than we already are
+    local sx, sz = cellOf(from)
+    local startKey = keyOf(sx, sz)
+
+    local nodes = { [startKey] = { cx = sx, cz = sz, t = 0, c = 0, h = 0, pos = from } }
+    local heap = {}
+    heapPush(heap, { cost = 0, key = startKey })
+    local closed, order = {}, {}
+    local best, bestTotal = nil, math.huge
+    local R2 = R * R
+
+    -- Stay with the previous plan's destination unless another is clearly better: with several equally good spots the
+    -- choice would otherwise flip from one re-plan to the next and the bot would dither instead of running.
+    local stickPos = (now - Planner.lastAt < 0.6) and Planner.lastGoal or nil
+    local stick = Config.PLAN_STICK
+    local stickR2 = Config.PLAN_STICK_RADIUS * Config.PLAN_STICK_RADIUS
+
+    while #heap > 0 do
+        local top = heapPop(heap)
+        local key = top.key
+        if not closed[key] then
+            closed[key] = true
+            local node = nodes[key]
+            if node.c - stick > bestTotal then break end   -- penalties are never negative: nothing later can beat the best
+            table.insert(order, node)
+            local pos = node.pos
+
+            -- a place to stop? it must stay safe, clear of the npcs, and suit the fight
+            if not hitAt(list, pos.X, pos.Z, node.t, node.t + settle) and Npcs.surfaceDistance(pos) >= Config.MIN_DISTANCE then
+                local total = node.c + penalty(pos)
+                if stickPos then
+                    local dx, dz = pos.X - stickPos.X, pos.Z - stickPos.Z
+                    if dx * dx + dz * dz <= stickR2 then total = total - stick end
+                end
+                if total < bestTotal then best, bestTotal = node, total end
+            end
+
+            for _, d in ipairs(DIRS) do
+                local nx, nz = node.cx + d[1], node.cz + d[2]
+                if (nx - sx) * (nx - sx) + (nz - sz) * (nz - sz) <= R2 then
+                    local nk = keyOf(nx, nz)
+                    if not closed[nk] then
+                        local step = d[3] * G / speed
+                        local tn = node.t + step + (node.parent == nil and Config.REACTION or 0)
+                        local npos = Vector3.new(nx * G, y, nz * G)
+                        -- never into an npc; through an attack only at a price
+                        if Npcs.surfaceDistance(npos) >= transitFloor then
+                            local hit = hitAt(list, npos.X, npos.Z, tn - step / 2, tn + step / 2)
+                            local cn = node.c + (tn - node.t) + (hit and Config.HIT_COST or 0)
+                            local old = nodes[nk]
+                            if (not old or cn < old.c - 1e-6) and Planner.stepOk(node.cx, node.cz, nx, nz, pos, npos, now) then
+                                nodes[nk] = { cx = nx, cz = nz, t = tn, c = cn, h = node.h + (hit and 1 or 0), pos = npos, parent = node }
+                                heapPush(heap, { cost = cn, key = nk })
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local safe = best ~= nil and best.h == 0
+    if not best then
+        -- nowhere is safe within reach: take the place where we can stay the longest, nearest first
+        local bestScore = -math.huge
+        for i = 1, math.min(#order, 150) do
+            local node = order[i]
+            local until_ = Hazards.firstHitWin(opts.windows, node.pos, Config.HORIZON + 4, pad)
+            local score = math.min(until_, 8) - node.t * 0.5
+            if score > bestScore then best, bestScore = node, score end
+        end
+    end
+    if not best then return nil end
+
+    local path, n = {}, best
+    while n do
+        table.insert(path, 1, n.pos)
+        n = n.parent
+    end
+    local startHit = Hazards.firstHitWin(opts.windows, from, Config.HORIZON, pad)
+    local plan = {
+        path = path, arrival = best.t, safe = safe, hits = best.h or 0, visited = #order,
+        next = #path >= 2 and lookahead(list, path, speed) or nil,
+        slack = (startHit == math.huge) and math.huge or (safe and (startHit - best.t) or -math.huge),
+    }
+    Planner.last = plan
+    Planner.lastGoal, Planner.lastAt = path[#path], now
+    return plan
 end
 
 -- =====================
--- NAV: movement, facing, path walking, choosing where to stand
+-- NAV: movement, facing, walking long distances
 -- Humanoid:Move(direction) is used instead of MoveTo(point): Move() is pure velocity and never touches facing, so it
 -- coexists with us setting the rotation ourselves every frame (AutoRotate = false is built for exactly this).
+-- Short, safety-critical movement is the Planner's; this module walks the long way (navmesh paths) and carries out
+-- whatever it was told.
 -- =====================
 Nav.goal = nil            -- where Humanoid:Move is taking us, or nil to stand still
 Nav.aim = nil             -- the point to face (set by the bot every frame)
@@ -1122,7 +1699,7 @@ Nav.pathing = false       -- a path is being walked
 Nav.computing = false     -- a path is being computed
 Nav.pathGoal = nil        -- destination of the path being walked
 Nav.controls = nil
-Nav.spot = nil            -- the last spot the local search chose (sticky, so the choice doesn't flicker)
+Nav.plan = nil            -- the planner's path we are following
 Nav.lastPos = nil
 Nav.lastMove = clock()
 
@@ -1206,6 +1783,26 @@ function Nav.stuck()
     return clock() - Nav.lastMove >= Config.STUCK_TIME
 end
 
+-- ---- following the planner ----
+
+-- The point to head for on a plan's path (the planner picks it: see Planner's lookahead).
+function Nav.nextPoint(plan)
+    if not plan or not plan.path or #plan.path < 2 then return nil end
+    return plan.next or plan.path[2]
+end
+
+-- Walk the planner's path (redone ten times a second). An empty or one-point path means "stay". Returns its destination.
+function Nav.follow(plan)
+    Nav.plan = plan
+    local path = plan and plan.path
+    if not path or #path < 2 then
+        Nav.stop()
+        return nil
+    end
+    Nav.setGoal(Nav.nextPoint(plan))
+    return path[#path]
+end
+
 -- ---- walking a computed path ----
 
 function Nav.stopPath()
@@ -1216,10 +1813,10 @@ function Nav.stopPath()
     Nav.pathing = false
 end
 
--- something that should pull us off a walk: a zone about to fire where we stand, or an npc right on top of us
+-- something that should pull us off a walk: an attack about to hit where we stand, or an npc right on top of us
 function Nav.interrupted()
     local pos = State.hrp.Position
-    return Hazards.threatened(pos) or Npcs.surfaceDistance(pos) < Config.MIN_DISTANCE
+    return Hazards.firstHit(pos, 1.2) < math.huge or Npcs.surfaceDistance(pos) < Config.MIN_DISTANCE
 end
 
 function Nav.walk(waypoints)
@@ -1268,15 +1865,17 @@ function Nav.pathTo(pos)
     return true
 end
 
--- is an attack zone (live now, or live by the time we get there) on the way we're walking?
+-- is an attack (live now, or live by the time we get there) on the way we're walking?
 function Nav.aheadBlocked()
     local md = State.hum.MoveDirection
     if md.Magnitude < 0.1 then return false end
     local dir = flat(md).Unit
     local speed = math.max(State.hum.WalkSpeed, 8)
     local from = State.hrp.Position
+    local wins = Hazards.windows(clock())
     for d = 3, math.max(8, speed * 0.9), 3 do
-        if Hazards.dangerAt(from + dir * d, d / speed + Config.REACTION) then return true end
+        local t = d / speed + Config.REACTION
+        if Hazards.hitWin(wins, from + dir * d, t, t + 0.4) then return true end
     end
     return false
 end
@@ -1290,169 +1889,23 @@ function Nav.ringRadius(group, barrier)
     return math.max(range - Config.RANGE_MARGIN, group.radius + Config.BIG_BODY_GAP, Config.MIN_DISTANCE + 6)
 end
 
--- legal points on that ring, nearest to us first
+-- legal points on that ring, best first: near us, and not inside the aggro range of npcs that are NOT part of this fight
 function Nav.ringPoints(group, barrier)
     local ringR = Nav.ringRadius(group, barrier)
     local me = State.hrp.Position
+    local wins = Hazards.windows(clock())
     local pts = {}
     for angle = 0, 345, 15 do
         local r = math.rad(angle)
         local p = Vector3.new(group.centroid.X + math.cos(r) * ringR, group.centroid.Y, group.centroid.Z + math.sin(r) * ringR)
-        if Npcs.surfaceDistance(p) >= Config.MIN_DISTANCE + 1 and not Hazards.insideAny(p) and Walls.floorBelow(p) then
-            table.insert(pts, p)
+        if Npcs.surfaceDistance(p) >= Config.MIN_DISTANCE + 1 and not Hazards.hitWin(wins, p, 0, Config.SETTLE + 2) and Walls.floorBelow(p) then
+            table.insert(pts, { pos = p, cost = flat(p - me).Magnitude / 16 + Bot.pullCost(p, group) })
         end
     end
-    table.sort(pts, function(a, b) return flat(a - me).Magnitude < flat(b - me).Magnitude end)
-    return pts, ringR
-end
-
--- Cheap (no raycasts) legality + score for standing at `cand`. nil = illegal. Lower is better.
-function Nav.scoreSpot(from, cand, ctx)
-    -- the destination must be safe by the time we get there and settle
-    if Hazards.destinationDanger(cand) then return nil end
-
-    -- the route may cross a precast we can leave before it fires, but never an active zone (unless we're already in one)
-    local crossings = Hazards.routeDanger(from, cand, ctx.speed)
-    if crossings > 0 and not ctx.threatened then return nil end
-
-    -- never into an npc: at the destination, and along the way (if we're already too close the route just can't get closer)
-    local _, surface = Npcs.nearest(cand)
-    if surface < Config.MIN_DISTANCE then return nil end
-    local floor = math.min(Config.MIN_DISTANCE - 1, ctx.startSurface) - 0.5
-    for i = 1, 3 do
-        if Npcs.surfaceDistance(from:Lerp(cand, i / 4)) < floor then return nil end
-    end
-
-    local score = crossings * 8
-
-    -- already in a zone: we must be OUT before it fires; spots we can't leave in time are heavily penalised
-    if ctx.threatened then
-        local exit = Hazards.exitTime(from, cand, ctx.speed)
-        local late = exit - (ctx.deadline - Config.PRECAST_SAFETY)
-        if late > 0 then score = score + 5 + late * 25 end
-        score = score + exit * 4   -- among ways out, take the quickest
-    end
-
-    -- stay inside the cast range, measured to the npc's centre
-    local _, centre = Npcs.nearestCenter(cand)
-    local high = ctx.range * 0.95
-    if centre > high then score = score + (centre - high) * 6 end
-
-    for _, n in ipairs(Npcs.list) do   -- mild penalty for standing right in front of an npc, and for crowding it
-        local toCand = flat(cand - n.pos)
-        local dist = toCand.Magnitude
-        if dist < Config.FLANK_RANGE and dist > 0.01 then
-            local facing = flat(n.root.CFrame.LookVector)
-            if facing.Magnitude > 0.01 then
-                local dot = facing.Unit:Dot(toCand.Unit)
-                if dot > 0.3 then score = score + (dot - 0.3) * 4 end
-            end
-            score = score + math.max(0, (Config.FLANK_RANGE - dist) / Config.FLANK_RANGE) * 0.5
-        end
-    end
-
-    score = score + (cand - from).Magnitude * 0.15   -- don't run further than needed
-    if Nav.spot and flat(cand - Nav.spot).Magnitude < 3 then score = score - 4 end   -- stay with the last choice
-    return score
-end
-
--- The best nearby spot: score everything cheaply, then wall-test only the best few.
-function Nav.findSpot(threatened, range)
-    local from = State.hrp.Position
-    local ctx = {
-        range = range,
-        speed = math.max(State.hum.WalkSpeed, 8),
-        threatened = threatened,
-        startSurface = Npcs.surfaceDistance(from),
-        deadline = Hazards.deadline(from),
-    }
-
-    local cands = {}
-    for _, radius in ipairs(Config.SEARCH_RADII) do
-        for angle = 0, 359, Config.SEARCH_ANGLE_STEP do
-            local r = math.rad(angle)
-            local cand = from + Vector3.new(math.cos(r) * radius, 0, math.sin(r) * radius)
-            local s = Nav.scoreSpot(from, cand, ctx)
-            if s then table.insert(cands, { pos = cand, score = s }) end
-        end
-    end
-    if #cands == 0 then return nil end
-    table.sort(cands, function(a, b) return a.score < b.score end)
-
-    local best, bestScore, checked, clear = nil, math.huge, 0, 0
-    for _, c in ipairs(cands) do
-        if checked >= Config.WALL_CHECKS or clear >= 8 then break end
-        checked = checked + 1
-        if Walls.moveClear(from, c.pos) then
-            clear = clear + 1
-            local total = c.score + Walls.penalty(c.pos) * 6   -- hugging walls is how you get cornered
-            if total < bestScore then best, bestScore = c.pos, total end
-        end
-    end
-    return best
-end
-
--- Nothing roomy and safe: back straight away from the attack (else the closest npc), taking the reachable spot that
--- is furthest outside every zone, and never walking closer to an npc.
-function Nav.flee()
-    local from = State.hrp.Position
-    local startSurface = Npcs.surfaceDistance(from)
-    local speed = math.max(State.hum.WalkSpeed, 8)
-    local deadline = Hazards.deadline(from)
-
-    local away, nearestZone = nil, math.huge
-    for _, zone in pairs(Hazards.active) do
-        local d = flat(zone.pos - from).Magnitude
-        if d < nearestZone then
-            nearestZone = d
-            away = flat(from - zone.pos)
-        end
-    end
-    if not away or away.Magnitude < 0.5 then
-        local nearest = Npcs.nearest(from)
-        away = nearest and flat(from - nearest.pos) or Vector3.zero
-    end
-    if away.Magnitude < 0.01 then away = -flat(State.hrp.CFrame.LookVector) end
-    away = away.Unit
-
-    local best, bestScore = nil, -math.huge
-    for _, radius in ipairs({ 4, 8, 13, 19, 26 }) do
-        for angle = 0, 340, 20 do
-            local r = math.rad(angle)
-            local dir = Vector3.new(math.cos(r), 0, math.sin(r))
-            local cand = from + dir * radius
-            if not Hazards.destinationDanger(cand) and Npcs.surfaceDistance(cand) >= startSurface - 1 and Walls.moveClear(from, cand) then
-                local score = math.min(Hazards.clearance(cand), 20) * 2 + dir:Dot(away) * 10 - radius * 0.3
-                score = score - Hazards.routeDanger(from, cand, speed) * 4
-                local late = Hazards.exitTime(from, cand, speed) - (deadline - Config.PRECAST_SAFETY)
-                if late > 0 then score = score - (5 + late * 25) end
-                if score > bestScore then best, bestScore = cand, score end
-            end
-        end
-    end
-    if best then return best end
-
-    -- boxed in: just rotate away from the danger until a wall-safe direction is found
-    for _, deg in ipairs({ 0, 30, -30, 60, -60, 90, -90, 120, -120 }) do
-        local r = math.rad(deg)
-        local dir = Vector3.new(away.X * math.cos(r) - away.Z * math.sin(r), 0, away.X * math.sin(r) + away.Z * math.cos(r))
-        local p = from + dir * 10
-        if Walls.moveClear(from, p) then return p end
-    end
-    return nil
-end
-
--- no npcs around: just get out of the attack (wall-aware)
-function Nav.dodgeAlone()
-    local from = State.hrp.Position
-    for _, radius in ipairs(Config.SEARCH_RADII) do
-        for angle = 0, 359, Config.SEARCH_ANGLE_STEP do
-            local r = math.rad(angle)
-            local cand = from + Vector3.new(math.cos(r) * radius, 0, math.sin(r) * radius)
-            if not Hazards.destinationDanger(cand) and Walls.moveClear(from, cand) then return cand end
-        end
-    end
-    return nil
+    table.sort(pts, function(a, b) return a.cost < b.cost end)
+    local out = {}
+    for i, p in ipairs(pts) do out[i] = p.pos end
+    return out, ringR
 end
 
 -- =====================
@@ -1478,7 +1931,6 @@ Skills.cooldowns = {}         -- [tool name] = { prev, peak, startT, learned }
 Skills.info = { buff = nil, attack = nil, plan = "" }
 Skills.pendingHits = {}       -- { checkAt, targets, barrier } waiting for a health check
 Skills.lastCooldown = nil     -- the attack's cooldown last frame (to see the moment it was cast)
-Skills.escape = { t = 0, slack = math.huge, dist = 0 }
 
 function Skills.isBuff(toolName)
     local n = normalize(toolName)
@@ -1632,43 +2084,13 @@ end
 
 -- ---- the buff as a dodging tool ----
 
--- time to spare when escaping the attack we're standing in (negative = we can't make it), and the distance to the exit
-function Skills.escapeSlack(speed)
-    local from = State.hrp.Position
-    local deadline = Hazards.deadline(from)
-    if deadline == math.huge then return math.huge, 0 end
-
-    local exitDist = math.huge
-    for step = 2, 30, 2 do
-        for angle = 0, 330, 30 do
-            local r = math.rad(angle)
-            local p = from + Vector3.new(math.cos(r) * step, 0, math.sin(r) * step)
-            if not Hazards.insideAny(p) and Walls.moveClear(from, p) then
-                exitDist = step
-                break
-            end
-        end
-        if exitDist < math.huge then break end
-    end
-    if exitDist == math.huge then return -math.huge, 0 end
-    return deadline - Config.PRECAST_SAFETY - (exitDist / speed + Config.REACTION), exitDist
-end
-
 -- Should the buff be spent on its SPEED? A reason, or nil:
---  A) we're inside an attack and can't get out in time at normal speed
+--  A) an attack is about to hit us and the planner says we'd only just make it out at normal speed (its slack = how
+--     much time we'd have to spare)
 --  B) several attacks are closing in and we can't attack anyway
 function Skills.speedReason(c, attack)
-    local speed = math.max(State.hum.WalkSpeed, 8)
-
-    if c.threatened then
-        local e = Skills.escape
-        if c.now - e.t > 0.1 then
-            e.t = c.now
-            e.slack, e.dist = Skills.escapeSlack(speed)
-        end
-        if e.slack < Config.RAGE_ESCAPE_SLACK and e.dist > 0 then
-            return string.format("buff to escape (%.1fs to spare)", math.max(e.slack, -9.9))
-        end
+    if c.threatened and c.slack and c.slack < Config.RAGE_ESCAPE_SLACK then
+        return string.format("buff to escape (%.1fs to spare)", math.max(c.slack, -9.9))
     end
 
     local canAttack = attack ~= nil and attack.ready and c.centreDist <= c.range
@@ -1680,7 +2102,7 @@ function Skills.speedReason(c, attack)
 end
 
 -- ---- using the skills: once per frame, after movement ----
--- c = { now, npc (nearest by centre), centreDist, range, byAggro, threatened, shielded, barrier }
+-- c = { now, npc (nearest by centre), centreDist, range, byAggro, threatened, slack, shielded, barrier }
 function Skills.update(c)
     local now = c.now
     local buff = Skills.buff and Skills.get(Skills.buff, Skills.lastBuff) or nil
@@ -2009,7 +2431,7 @@ function ESP.updateZone(zone, now)
         local speed = zone.flatVel.Magnitude
         if v.path then
             if State.esp and speed > 1 then
-                local len = speed * Config.ORB_STAY
+                local len = speed * 1.0   -- the next second of its flight
                 local a = zone.pos
                 local b = a + zone.flatVel.Unit * len
                 v.path.Size = Vector3.new(0.5, 0.5, len)
@@ -2051,6 +2473,32 @@ function ESP.destroyNpc(data)
     destroy(data.highlight)
     destroy(data.gui)
     destroy(data.disc)
+end
+
+-- the planner's route: a handful of line segments, reused every plan instead of rebuilt
+ESP.planParts = {}
+function ESP.setPlan(path)
+    local n = (path and State.esp) and (#path - 1) or 0
+    for i = 1, math.max(n, #ESP.planParts) do
+        local part = ESP.planParts[i]
+        if i <= n then
+            if not part then
+                part = ESP.marker("_Plan", Enum.PartType.Block, Color3.fromRGB(255, 255, 0))
+                ESP.planParts[i] = part
+            end
+            local a, b = path[i], path[i + 1]
+            local len = (b - a).Magnitude
+            if len > 0.05 then
+                part.Size = Vector3.new(0.15, 0.15, len)
+                part.CFrame = CFrame.lookAt((a + b) / 2, b)
+                part.Transparency = 0.15
+            else
+                part.Transparency = 1
+            end
+        elseif part then
+            part.Transparency = 1
+        end
+    end
 end
 
 function ESP.clearPath()
@@ -2122,12 +2570,12 @@ function ESP.update(now, stats)
         local tooClose = surface < Config.MIN_DISTANCE
 
         data.highlight.Enabled = on
-        data.highlight.FillColor = isTarget and ESP.RED or ESP.ORANGE
+        data.highlight.FillColor = isTarget and ESP.RED or (stats.inPool and stats.inPool[n.model] and ESP.ORANGE or Color3.fromRGB(120, 120, 120))
         data.highlight.OutlineColor = isTarget and ESP.RED or Color3.fromRGB(200, 100, 0)
         data.highlight.FillTransparency = isTarget and 0.4 or 0.7
         data.gui.Enabled = on and Config.ESP_LABELS
         if text then
-            data.label.Text = string.format("%s%s  %.0f%s", isTarget and "> " or "", n.model.Name, surface,
+            data.label.Text = string.format("%s%s  %.0f%%  %.0f%s", isTarget and "> " or "", n.model.Name, n.hp * 100, surface,
                 n.aggro and string.format("  (aggro %.0f)", n.aggro) or "")
             data.label.TextColor3 = tooClose and ESP.RED or (isTarget and ESP.GREEN or ESP.WHITE)
         end
@@ -2186,6 +2634,7 @@ function ESP.setAll(on)
     end
     if not on then
         ESP.clearPath()
+        ESP.setPlan(nil)
         ESP.ring.Transparency, ESP.aggroRing.Transparency = 1, 1
         ESP.goal.Transparency, ESP.tracer.Transparency = 1, 1
     end
@@ -2193,6 +2642,8 @@ function ESP.setAll(on)
 end
 
 function ESP.destroyAll()
+    for _, p in ipairs(ESP.planParts) do destroy(p) end
+    ESP.planParts = {}
     for _, data in pairs(ESP.npcs) do ESP.destroyNpc(data) end
     ESP.npcs = {}
     for _, zone in pairs(Hazards.active) do ESP.detach(zone) end
@@ -2217,7 +2668,7 @@ UI.C = {
 UI.MODE_COLORS = {
     ["DODGE"] = UI.C.red, ["AVOID"] = UI.C.orange, ["FLEE"] = UI.C.purple, ["REPOSITION"] = UI.C.blue,
     ["FIGHT"] = UI.C.green, ["APPROACH"] = UI.C.green, ["SIEGE"] = UI.C.yellow, ["ALL-IN"] = Color3.fromRGB(255, 64, 64),
-    ["IDLE"] = UI.C.grey, ["OFF"] = UI.C.grey, ["DEAD"] = UI.C.grey,
+    ["ADVANCE"] = UI.C.yellow, ["DONE"] = UI.C.green, ["IDLE"] = UI.C.grey, ["OFF"] = UI.C.grey, ["DEAD"] = UI.C.grey,
 }
 
 local function hex(c)
@@ -2521,6 +2972,16 @@ function UI.build()
     end
     UI.restyle()
 
+    -- the dungeon
+    local dungeon = card(body, "DUNGEON")
+    UI.refs.room = row(dungeon, "Room")
+    UI.refs.progress = row(dungeon, "Progress")
+    UI.refs.tally = row(dungeon, "Kills / deaths")
+    UI.refs.npcs = label(dungeon, 12, Enum.Font.Code, UI.C.dim)
+    UI.refs.npcs.Size = UDim2.new(1, 0, 0, 64)
+    UI.refs.npcs.TextYAlignment = Enum.TextYAlignment.Top
+    UI.refs.npcs.LayoutOrder = nextOrder(dungeon)
+
     -- the target, and where the cast range comes from
     local target = card(body, "TARGET")
     UI.refs.target = row(target, "Target")
@@ -2613,6 +3074,32 @@ function UI.update()
     end
     r.barrier.Text = st.barrier and col(UI.C.yellow, string.format("stuck at %.0f%s", st.barrier.centerDist, st.barrier.holdFire and ", not reaching" or "")) or col(UI.C.dim, "none")
 
+    -- the dungeon
+    local active, nextRoom = Dungeon.active(), Dungeon.next(now)
+    local done, total = Dungeon.progress()
+    if Dungeon.finished then
+        r.room.Text = col(UI.C.green, "<b>COMPLETE</b>")
+    elseif active then
+        r.room.Text = string.format("%s  %s", esc(active.name), col(UI.C.dim, active.alive .. " npc(s) left"))
+    elseif nextRoom then
+        r.room.Text = col(UI.C.yellow, "heading to " .. esc(nextRoom.name))
+    else
+        r.room.Text = col(UI.C.dim, "--")
+    end
+    r.progress.Text = total > 0 and string.format("%d / %d rooms cleared", done, total) or col(UI.C.dim, "no rooms found")
+    r.tally.Text = string.format("%d  /  %s", State.kills, col(State.deaths > 0 and UI.C.orange or UI.C.dim, tostring(State.deaths)))
+    -- the npcs closest to us: who they are, how hurt, how far, how far their aggro reaches
+    local rows = {}
+    local near = {}
+    for _, n in ipairs(Npcs.list) do table.insert(near, { n = n, d = flat(State.hrp.Position - n.pos).Magnitude }) end
+    table.sort(near, function(a, b) return a.d < b.d end)
+    for i = 1, math.min(4, #near) do
+        local n = near[i].n
+        local mark = (st.target and n.model == st.target.model) and ">" or " "
+        rows[i] = col(UI.C.dim, string.format("%s %-16s %3.0f%% %4.0f  aggro %s", mark, esc(n.model.Name):sub(1, 16), n.hp * 100, near[i].d, n.aggro and string.format("%.0f", n.aggro) or "-"))
+    end
+    r.npcs.Text = #rows > 0 and table.concat(rows, "\n") or col(UI.C.dim, "no npcs")
+
     local counts = Hazards.counts(now)
     local function setChip(name, c, n)
         c.Text = string.format("%s  %d", name, n)
@@ -2624,22 +3111,24 @@ function UI.update()
     setChip("ORB", r.chipOrb, counts.orb)
     setChip("?", r.chipUnk, counts.unknown)
 
-    local deadline = Hazards.deadline(State.hrp.Position)
-    if deadline < math.huge then
-        if deadline > 0 then
-            r.threat.Text = col(UI.C.red, string.format("<b>INSIDE</b>  fires in %.1fs", deadline))
-            setBar(r.threatBar, deadline / Config.PRECAST_DELAY, UI.C.red)
+    local hitIn = Hazards.firstHit(State.hrp.Position, Config.HORIZON)
+    if hitIn < math.huge then
+        if hitIn > 0.05 then
+            r.threat.Text = col(UI.C.red, string.format("<b>HIT IN</b>  %.1fs here", hitIn))
+            setBar(r.threatBar, 1 - hitIn / Config.HORIZON, UI.C.red)
         else
-            r.threat.Text = col(UI.C.red, "<b>INSIDE ACTIVE ZONE</b>")
+            r.threat.Text = col(UI.C.red, "<b>INSIDE AN ATTACK</b>")
             setBar(r.threatBar, 1, UI.C.red)
         end
     elseif counts.soonest < math.huge and counts.soonest > 0 then
-        r.threat.Text = col(UI.C.orange, string.format("precast fires in %.1fs", counts.soonest))
+        r.threat.Text = col(UI.C.orange, string.format("precast fires in %.1fs (not here)", counts.soonest))
         setBar(r.threatBar, counts.soonest / Config.PRECAST_DELAY, UI.C.orange)
     else
         r.threat.Text = col(UI.C.green, "clear")
         setBar(r.threatBar, 0, UI.C.green)
     end
+    local pad = Hazards.extraPad
+    if pad > 0.05 then r.threat.Text = r.threat.Text .. col(UI.C.dim, string.format("  (+%.1f caution)", pad)) end
 
     -- the buff's cooldown starts at (buff time + cooldownLength): the part above cooldownLength is the BUFF
     local buff = Skills.info.buff
@@ -2664,19 +3153,23 @@ end
 
 -- =====================
 -- BOT: the per-frame decision loop
---   threatened (an attack is about to fire where we stand, or an npc is on top of us)  -> DODGE / AVOID / REPOSITION
---   outside the cast range of the nearest npc group                                    -> APPROACH (pathfind to the stand ring)
---   inside it                                                                          -> FIGHT (hold still; adjust only when needed)
+--   something will hit where we stand (or an npc is on top of us)   -> DODGE   the planner finds the way out
+--   npcs in the fight, but out of cast range                          -> APPROACH walk to the stand ring (avoiding other groups)
+--   npcs in the fight, inside cast range                              -> FIGHT   hold still, move only when something is wrong
+--   no npcs                                                           -> ADVANCE to the next room, or DONE when none is left
 -- Skills are used every frame, whatever the movement is doing, as soon as an npc is inside its cast range.
 -- =====================
-Bot.stats = {}               -- what the UI and ESP show: target, centreDist, castRange, group, barrier, standRadius
+Bot.stats = {}               -- what the UI and ESP show: target, centreDist, castRange, group, barrier, standRadius, slack
 Bot.barriers = setmetatable({}, { __mode = "k" })   -- [npc model] = { centerDist, pos, expires, holdFire, misses }
 Bot.approach = { model = nil, best = math.huge, progressT = 0, anchor = Vector3.zero, anchorT = 0 }
-Bot.lastSearch = 0
+Bot.advance = { room = nil, best = math.huge, progressT = 0, anchorT = 0, anchor = Vector3.zero }
+Bot.lastPlan = 0
 Bot.lastPath = 0
 Bot.lastUI = 0
 Bot.lastError = 0
 Bot.lastNoPath = 0
+Bot.lastStep = nil
+Bot.lastUnseen = 0
 Bot.stopped = false
 
 -- one bad frame (a part vanishing mid-death ...) must never kill the loop or flood the output
@@ -2702,9 +3195,9 @@ end
 function Bot.reset(reason)
     Nav.stopPath()
     ESP.clearPath()
-    ESP.setGoal(nil)
+    ESP.setPlan(nil)
     Nav.stop()
-    Nav.spot, Nav.pathGoal, Nav.lastPos, Nav.lastMove, Nav.computing = nil, nil, nil, clock(), false
+    Nav.plan, Nav.pathGoal, Nav.lastPos, Nav.lastMove, Nav.computing = nil, nil, nil, clock(), false
     Skills.buffUntil, Skills.attackNotBefore, Skills.busy = 0, 0, false   -- buffs are lost on death
     Log.add(reason)
 end
@@ -2719,6 +3212,20 @@ function Bot.notAlive()
     if State.hrp and now - Bot.lastUI >= 0.1 then
         Bot.lastUI = now
         pcall(UI.update)
+    end
+end
+
+-- Something hurt us. If the attacks we know about don't explain it (none near us, no npc within reach), it was something
+-- we didn't see coming: pad every attack more for a while, and remember what appeared just before as suspects.
+function Bot.onDamage(amount, pos)
+    if amount < math.max(3, State.hum.MaxHealth * 0.03) then return end
+    if Hazards.nearby(pos, 4) > 0 then return end                       -- an attack we know of was right there
+    if Npcs.surfaceDistance(pos) < Config.MIN_DISTANCE + 4 then return end   -- an npc in melee range
+    local suspects = Hazards.blame(pos)
+    local now = clock()
+    if now - Bot.lastUnseen > 1 then
+        Bot.lastUnseen = now
+        Log.add(string.format("Hit by something unseen (-%.0f)%s", amount, #suspects > 0 and (": " .. table.concat(suspects, ", "):sub(1, 60)) or ""))
     end
 end
 
@@ -2748,10 +3255,19 @@ function Bot.onCharacter(char, initial)
             Log.add("Spawn shield: all-in attack")
         end
 
+        local lastHealth = hum.Health
+        hum.HealthChanged:Connect(function(health)
+            if health < lastHealth and State.enabled and clock() >= State.shieldUntil then
+                pcall(Bot.onDamage, lastHealth - health, root.Position)
+            end
+            lastHealth = health
+        end)
+
         hum.Died:Connect(function()
             if State.wasAlive then
                 State.wasAlive = false
-                Bot.reset("Died")
+                State.deaths = State.deaths + 1
+                Bot.reset("Died (" .. State.deaths .. " so far)")
                 State.setMode("DEAD")
             end
         end)
@@ -2785,11 +3301,49 @@ function Bot.idle(now)
         Nav.stopPath()
         Nav.stop()
         ESP.clearPath()
-        ESP.setGoal(nil)
+        ESP.setPlan(nil)
         Nav.setControls(true)
         State.setMode("OFF")
     end
     Bot.refreshUI(now)
+end
+
+-- ---- what makes a good place to stand ----
+
+-- The cost (in "seconds of walking") of standing at `pos` because it lies inside the aggro range of an npc that is NOT
+-- part of this fight: we would wake it up.
+function Bot.pullCost(pos, group)
+    if not Config.AVOID_OTHER_AGGRO then return 0 end
+    local cost = 0
+    local mine = {}
+    for _, m in ipairs(group and group.members or {}) do mine[m.model] = true end
+    for _, n in ipairs(Npcs.list) do
+        if not mine[n.model] and n.aggro and flat(pos - n.pos).Magnitude < n.aggro then cost = cost + 2 end
+    end
+    return cost
+end
+
+-- Everything about a spot that isn't "can I get there safely": inside the cast range, not in front of an npc, not waking
+-- another group. Returned as extra seconds-of-walking, so the planner can weigh it against the way there.
+function Bot.penaltyFor(group, range)
+    local high = range * 0.95
+    return function(pos)
+        local pen = 0
+        local _, centre = Npcs.nearestCenter(pos, Npcs.pool)
+        if centre > high then pen = pen + (centre - high) * 0.5 end
+        for _, n in ipairs(Npcs.pool) do   -- mild: not right in front of an npc
+            local to = flat(pos - n.pos)
+            local dist = to.Magnitude
+            if dist < Config.FLANK_RANGE and dist > 0.01 then
+                local facing = flat(n.root.CFrame.LookVector)
+                if facing.Magnitude > 0.01 then
+                    local dot = facing.Unit:Dot(to.Unit)
+                    if dot > 0.3 then pen = pen + (dot - 0.3) * 0.4 end
+                end
+            end
+        end
+        return pen + Bot.pullCost(pos, group)
+    end
 end
 
 -- ---- barriers ----
@@ -2850,64 +3404,41 @@ function Bot.watchBarrier(target, centre, now)
     end
 end
 
--- ---- the three things the bot can be doing ----
+-- ---- the things the bot can be doing ----
 
--- no npcs: only dodge
-function Bot.aloneStep(threatened, now)
-    Nav.aim = nil
-    Nav.stopPath()
-    ESP.clearPath()
-    Bot.stats.target, Bot.stats.group = nil, nil
-    if threatened then
-        State.setMode("DODGE")
-        local spot = Nav.dodgeAlone()
-        if spot then
-            Nav.spot = spot
-            Nav.setGoal(spot)
-            ESP.setGoal(spot)
-        end
-    else
-        State.setMode("IDLE")
-        ESP.setGoal(nil)
-    end
-end
-
--- an attack is about to fire where we stand / is in our way / an npc is on top of us: get out
+-- Something will hit us, or an npc is on top of us: ask the planner for the way out and walk it.
 function Bot.dodgeStep(f)
     Nav.stopPath()
     ESP.clearPath()
     Nav.pathGoal = nil
-
     local me = State.hrp.Position
-    local goalBad = Nav.spot ~= nil and (Hazards.destinationDanger(Nav.spot) or not Walls.moveClear(me, Nav.spot))
-    if goalBad then Nav.spot = nil end
 
-    if not Nav.spot or f.now - Bot.lastSearch >= 0.06 then
-        Bot.lastSearch = f.now
-        local spot = Nav.findSpot(f.threatened, f.range)
-        local mode = f.threatened and "DODGE" or (f.aheadBlocked and "AVOID" or "REPOSITION")
-        if not spot and (f.threatened or f.tooClose) then
-            spot = Nav.flee()   -- no roomy safe spot: back straight out of it
-            mode = "FLEE"
-        elseif not spot and f.aheadBlocked then
-            Nav.stop()   -- nowhere safe to go around it: stand still, don't walk into it
-            Nav.spot = nil
+    if f.now - Bot.lastPlan >= Config.PLAN_RATE or not Nav.plan then
+        Bot.lastPlan = f.now
+        local function make(radius)
+            return Planner.plan({ from = me, speed = f.speed, windows = f.wins, penalty = f.penalty, radius = radius })
         end
-        State.setMode(mode)
-        if spot then
-            Nav.spot = spot
-            Nav.setGoal(spot)
-            ESP.setGoal(spot)
-        else
-            ESP.setGoal(nil)
+        local plan = make(Config.PLAN_RADIUS)
+        if plan and not plan.safe then plan = make(Config.PLAN_RADIUS_MAX) or plan end   -- nothing safe near: look further
+        -- the planner's steps were checked with a cheap ray; the first one gets the full body check
+        local nextPoint = Nav.nextPoint(plan)
+        if nextPoint and not Walls.moveClear(me, nextPoint) then
+            Planner.blockStep(me, plan.path[2])
+            plan = make(Config.PLAN_RADIUS) or plan
         end
+        local goal = Nav.follow(plan)
+        ESP.setPlan(plan and plan.path)
+        ESP.setGoal(goal)
+        Bot.stats.slack = plan and plan.slack or nil
+        State.setMode(f.threatened and ((plan and plan.safe) and "DODGE" or "FLEE") or "REPOSITION")
     end
 end
 
 -- outside the cast range: pathfind to the stand ring
 function Bot.approachStep(f)
     State.setMode("APPROACH")
-    Nav.spot = nil
+    Nav.plan = nil
+    ESP.setPlan(nil)
     ESP.setGoal(nil)
     if f.target then Bot.watchBarrier(f.target, f.centre, f.now) end
 
@@ -2917,7 +3448,7 @@ function Bot.approachStep(f)
         Bot.stats.standRadius = ringR
 
         local needPath = not Nav.pathing
-        if not Nav.pathGoal or Npcs.surfaceDistance(Nav.pathGoal) < Config.MIN_DISTANCE + 1 or Hazards.destinationDanger(Nav.pathGoal)
+        if not Nav.pathGoal or Npcs.surfaceDistance(Nav.pathGoal) < Config.MIN_DISTANCE + 1
             or (not f.barrier and math.abs(flat(Nav.pathGoal - f.group.centroid).Magnitude - ringR) > 4) then
             needPath = true
         end
@@ -2958,7 +3489,7 @@ function Bot.approachStep(f)
     end
 end
 
--- inside the cast range: stay put; move only when something is wrong with where we are
+-- inside the cast range and nothing threatening: stay put; move only when something is wrong with where we are
 function Bot.fightStep(f)
     Nav.stopPath()
     ESP.clearPath()
@@ -2966,37 +3497,99 @@ function Bot.fightStep(f)
     local me = State.hrp.Position
     State.setMode(f.shielded and "ALL-IN" or (f.atBarrier and "SIEGE" or "FIGHT"))
 
-    local goalBad = Nav.spot ~= nil and (Hazards.destinationDanger(Nav.spot) or not Walls.moveClear(me, Nav.spot))
-    if Nav.spot and not goalBad then   -- still walking to the last chosen spot
-        if flat(me - Nav.spot).Magnitude < 2 then
-            Nav.spot = nil
-            Nav.stop()
-        end
+    local pull = Bot.pullCost(me, f.group)
+    local needMove = f.centre > f.range * 0.95 or f.surface < Config.MIN_DISTANCE + 2 or pull > 0
+    if not needMove then
+        Nav.plan = nil
+        Nav.stop()
+        ESP.setPlan(nil)
+        ESP.setGoal(nil)
         return
     end
-    Nav.spot = nil
 
-    -- worth moving? drifting toward the edge of the range, or an npc closer than comfortable
-    local needMove = goalBad or f.centre > f.range * 0.95 or f.surface < Config.MIN_DISTANCE + 2
-    if needMove and f.now - Bot.lastSearch >= Config.STEER_RATE then
-        Bot.lastSearch = f.now
-        local spot = Nav.findSpot(false, f.range)
-        if spot then
-            Nav.spot = spot
-            Nav.setGoal(spot)
-            ESP.setGoal(spot)
-            return
+    if f.now - Bot.lastPlan >= 0.5 or not Nav.goal then   -- (no need to re-plan a short walk ten times a second)
+        Bot.lastPlan = f.now
+        local plan = Planner.plan({ from = me, speed = f.speed, windows = f.wins, penalty = f.penalty, radius = Config.PLAN_RADIUS })
+        local goal = Nav.follow(plan)
+        local nextPoint = Nav.nextPoint(plan)
+        if nextPoint and not Walls.moveClear(me, nextPoint) then
+            Planner.blockStep(me, plan.path[2])
+            Nav.stop()
+        end
+        ESP.setPlan(plan and plan.path)
+        ESP.setGoal(goal)
+        if plan and #plan.path >= 2 then State.setMode("REPOSITION") end
+    end
+end
+
+-- no npcs in the fight: head for the next room, or finish
+function Bot.advanceStep(f)
+    Nav.aim = nil
+    local room = Dungeon.next(f.now)
+    Bot.stats.target, Bot.stats.group, Bot.stats.barrier = nil, nil, nil
+
+    if not room then
+        Nav.stopPath()
+        Nav.stop()
+        ESP.clearPath()
+        ESP.setGoal(nil)
+        State.setMode(Dungeon.finished and "DONE" or "IDLE")
+        return
+    end
+
+    local goal = Dungeon.goal(room)
+    local me = State.hrp.Position
+    if not goal then   -- a room with no parts to aim for
+        Dungeon.blocked[room.room] = f.now + Config.ADVANCE_RETRY
+        return
+    end
+    State.setMode("ADVANCE")
+    ESP.setGoal(goal)
+
+    if flat(me - goal).Magnitude <= Config.ROOM_ARRIVE then   -- arrived: wait for its npcs to appear (Dungeon marks it empty if not)
+        Nav.stopPath()
+        Nav.stop()
+        return
+    end
+
+    -- not getting anywhere for a long time: give this room up for a while
+    local a = Bot.advance
+    if a.room ~= room.room then
+        a.room, a.best, a.progressT, a.anchor, a.anchorT = room.room, math.huge, f.now, me, f.now
+    end
+    local dist = flat(me - goal).Magnitude
+    if dist < a.best - Config.BARRIER_PROGRESS then a.best, a.progressT = dist, f.now end
+    if f.now - a.progressT >= Config.BARRIER_NO_PROGRESS then
+        Dungeon.blocked[room.room] = f.now + Config.ADVANCE_RETRY
+        Log.add("Can't reach " .. room.name .. ", trying again later")
+        Nav.stopPath()
+        a.room = nil
+        return
+    end
+
+    if f.now - Bot.lastPath >= Config.REPATH_RATE and not Nav.computing then
+        Bot.lastPath = f.now
+        if not Nav.pathing or not Nav.pathGoal or flat(Nav.pathGoal - goal).Magnitude > 6 then
+            Nav.computing = true
+            if not Nav.pathTo(goal) and State.alive() and not Nav.interrupted() then
+                Nav.setGoal(goal)   -- no navmesh path: walk straight
+            end
+            Nav.computing = false
         end
     end
-    if not needMove then
-        Nav.stop()
-        ESP.setGoal(nil)
+    if Nav.pathing and Nav.stuck() then
+        local dir = Nav.goal and flat(Nav.goal - me)
+        if not dir or dir.Magnitude < 0.01 then dir = flat(State.hrp.CFrame.LookVector) end
+        Nav.setGoal(me + dir.Unit * 5)
+        Bot.lastPath = 0
     end
 end
 
 function Bot.step()
     if not Bot.refreshChar() then return end
     local now = clock()
+    local dt = Bot.lastStep and math.min(now - Bot.lastStep, 0.5) or 0
+    Bot.lastStep = now
     Walls.refresh(now)
     if not State.enabled then
         Bot.idle(now)
@@ -3007,23 +3600,38 @@ function Bot.step()
     Hazards.update(now)
     Hazards.scan(now)
     Npcs.refresh(0)
+    local me = State.hrp.Position
+    Dungeon.refresh(now, me)
+    Npcs.pool = Dungeon.pool(Npcs.list, me)
     Npcs.buildGroups()
     Skills.watch(now)
+    Hazards.setCaution(State.hum.MaxHealth > 0 and State.hum.Health / State.hum.MaxHealth or 1, dt)
 
-    local me = State.hrp.Position
     local stats = Bot.stats
-    local nearest, surface = Npcs.nearest(me)
+    local pool = Npcs.pool
+    local nearest, surface = Npcs.nearest(me, pool)
     local target = Npcs.pick(nearest, surface, me)
+    local inPool = {}
+    for _, n in ipairs(pool) do inPool[n.model] = true end
+    stats.inPool = inPool
 
-    -- spawn immortality: attacks can't hurt us, so ignore them and go all-in on attacking
+    -- will anything hit where we stand? (spawn immortality: attacks can't hurt us, so ignore them and go all-in)
     local shielded = now < State.shieldUntil
-    local threatened = not shielded and Hazards.threatened(me)
-    local tooClose = not shielded and nearest ~= nil and surface < Config.MIN_DISTANCE
-    local aheadBlocked = not threatened and not shielded and Nav.aheadBlocked()
+    local wins = Hazards.windows(now)
+    local hitIn = shielded and math.huge or Hazards.firstHitWin(wins, me, Config.HORIZON)
+    local threatened = hitIn < math.huge
+    local anyNpc, anySurface = Npcs.nearest(me, Npcs.list)
+    local tooClose = not shielded and anyNpc ~= nil and anySurface < Config.MIN_DISTANCE
+    local speed = math.max(State.hum.WalkSpeed, 8)
 
-    if not nearest then
-        Bot.aloneStep(threatened, now)
-        stats.target, stats.group, stats.barrier = nil, nil, nil
+    if not target then
+        stats.target, stats.group, stats.barrier, stats.slack = nil, nil, nil, nil
+        if threatened or tooClose then
+            Bot.dodgeStep({ now = now, wins = wins, speed = speed, threatened = threatened, penalty = function() return 0 end })
+        else
+            ESP.setPlan(nil)
+            Bot.advanceStep({ now = now })
+        end
         Skills.update({ now = now })
         ESP.update(now, stats)
         Bot.refreshUI(now)
@@ -3031,7 +3639,7 @@ function Bot.step()
     end
 
     local group = Npcs.groups[target.group]
-    local reachNpc, centre = Npcs.nearestCenter(me)   -- skills reach by distance to an npc's centre
+    local reachNpc, centre = Npcs.nearestCenter(me, Npcs.list)   -- skills reach by distance to an npc's centre
     local targetCentre = flat(me - target.pos).Magnitude
     local barrier = Bot.barrierOf(target, targetCentre, now)
     local atBarrier = barrier ~= nil and targetCentre <= barrier.centerDist + Config.BARRIER_LEEWAY
@@ -3042,15 +3650,22 @@ function Bot.step()
     stats.centreDist = targetCentre
     stats.castRange = (Npcs.castRange(target, barrier))
     stats.standRadius = group and Nav.ringRadius(group, barrier) or nil
+    if not threatened then stats.slack = nil end
 
     local f = {
         now = now, target = target, group = group, barrier = barrier, atBarrier = atBarrier,
-        centre = centre, surface = surface, range = groupRange,
-        threatened = threatened, tooClose = tooClose, aheadBlocked = aheadBlocked, shielded = shielded,
+        centre = centre, surface = surface, range = groupRange, speed = speed, wins = wins,
+        threatened = threatened, tooClose = tooClose, shielded = shielded,
+        penalty = Bot.penaltyFor(group, groupRange),
     }
 
-    if threatened or tooClose or aheadBlocked then
+    if threatened or tooClose then
         Bot.dodgeStep(f)
+    elseif Nav.aheadBlocked() then   -- an attack lies across the way we're walking: wait for it instead of walking in
+        State.setMode("AVOID")
+        Nav.stopPath()
+        Nav.stop()
+        ESP.clearPath()
     elseif centre > groupRange then
         Bot.approachStep(f)
     else
@@ -3061,7 +3676,7 @@ function Bot.step()
     Nav.aim = group and ((group.count >= 2) and group.centroid or target.pos) or nil
     Skills.update({
         now = now, npc = reachNpc, centreDist = centre, range = castRange, byAggro = byAggro,
-        threatened = threatened, shielded = shielded, barrier = barrier,
+        threatened = threatened, slack = stats.slack, shielded = shielded, barrier = barrier,
     })
 
     ESP.update(now, stats)
@@ -3072,6 +3687,7 @@ end
 
 function Bot.start()
     print("[AutoCombat] starting...")
+    State.startedAt = clock()
     State.char = player.Character or player.CharacterAdded:Wait()
     State.hrp = State.char:WaitForChild("HumanoidRootPart")
     State.hum = State.char:WaitForChild("Humanoid")
@@ -3149,7 +3765,7 @@ function Bot.boot()
     end
 end
 
-API.Config, API.State, API.Log, API.Npcs, API.Hazards, API.Walls = Config, State, Log, Npcs, Hazards, Walls
-API.Nav, API.Skills, API.ESP, API.UI, API.Bot = Nav, Skills, ESP, UI, Bot
+API.Config, API.State, API.Log, API.Npcs, API.Dungeon, API.Hazards, API.Walls = Config, State, Log, Npcs, Dungeon, Hazards, Walls
+API.Planner, API.Nav, API.Skills, API.ESP, API.UI, API.Bot = Planner, Nav, Skills, ESP, UI, Bot
 
 Bot.boot()
