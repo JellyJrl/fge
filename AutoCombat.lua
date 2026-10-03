@@ -87,7 +87,11 @@ local Config = {
     WORKSPACE_ROOT_AS_ATTACK = false, -- off: only parts named 'precast'/'hitbox', npc-named parts and orbs count
     MODEL_AS_ATTACK         = true,  -- a whole Model dropped straight into workspace counts as an attack too
     GENERIC_MAX_AGE         = 6,     -- a model like that still around after this long is scenery - stop treating it as danger
-    IGNORE_NAMES            = { "groundaura" },   -- normalized names (lowercase letters/digits) never treated as attacks
+    -- HARD ignore list, as normalized names (lowercase letters/digits). Anything whose name CONTAINS one of these, or
+    -- that sits inside something that does, is invisible to the bot: never an attack zone (no dodging), never drawn
+    -- by the ESP, never counted in the UI, never learned from, never a wall for the raycasts. Nothing overrides it,
+    -- not even a name that was learned from a death.
+    IGNORE_NAMES            = { "groundaura" },
     HITBOX_OWNER_MAX_DIST   = 50,    -- fallback proximity radius when an attack's name doesn't reveal its npc
     HITBOX_OWNER_TIMEOUT    = 2,     -- after this long without a duration, fall back to watching the hitbox itself
     HITBOX_WATCH_ENABLED    = true,  -- watch hitboxes for "active" flags / lifetimes / fading to know when they end
@@ -420,12 +424,28 @@ Learn.appliedByTarget = {}   -- [ability][npc name] = studs
 Learn.manual, Learn.manualByTarget = {}, {}   -- this manual recording session
 Learn.auto, Learn.autoByTarget = {}, {}       -- bot self-play this session
 
+-- On the hard ignore list (Config.IGNORE_NAMES)? Matches any name that contains an entry, after normalizing
+-- ("Ground Aura", "GroundAura_2", "groundaura-big" all match). Memoized: the same few names repeat constantly.
+Learn.hardIgnoreCache = {}
+function Learn.isHardIgnoredName(name)
+    local cached = Learn.hardIgnoreCache[name]
+    if cached ~= nil then return cached end
+
+    local key = normalize(name)
+    local hit = false
+    for _, ignore in ipairs(Config.IGNORE_NAMES) do
+        if ignore ~= "" and key:find(ignore, 1, true) then
+            hit = true
+            break
+        end
+    end
+    Learn.hardIgnoreCache[name] = hit
+    return hit
+end
+
 -- A name is permanently or learned-safe: it never shows up in the danger system, the ESP or the UI.
 function Learn.isIgnoredName(name)
-    for _, ignore in ipairs(Config.IGNORE_NAMES) do
-        if name == ignore then return true end
-    end
-    return Learn.ignoreNames[name] == true
+    return Learn.isHardIgnoredName(name) or Learn.ignoreNames[name] == true
 end
 
 -- Keeps the largest confirmed distance ever seen: once something is confirmed to work, that stays true.
@@ -474,6 +494,26 @@ function Learn.applyRanges(bank)
     end
 end
 
+local function addToSavedList(safety, listName, name)
+    safety[listName] = safety[listName] or {}
+    for _, nm in ipairs(safety[listName]) do
+        if nm == name then return false end   -- already saved
+    end
+    table.insert(safety[listName], name)
+    return true
+end
+
+local function removeFromSavedList(safety, listName, name)
+    local removed = false
+    for i = #(safety[listName] or {}), 1, -1 do
+        if safety[listName][i] == name then
+            table.remove(safety[listName], i)
+            removed = true
+        end
+    end
+    return removed
+end
+
 -- Everything saved from earlier sessions: ranges, safety margins, per-npc distances, names, death history.
 function Learn.applyAll(data)
     Learn.applyRanges(Learn.combine(data))
@@ -496,37 +536,34 @@ function Learn.applyAll(data)
             end
         end
     end
+    -- a hard-ignored name can never be an attack, even if an earlier session blamed it for a death: drop it here
+    -- and from the saved file, so it doesn't come back
+    local purged = {}
     for _, nm in ipairs(type(s.learnedAttackNames) == "table" and s.learnedAttackNames or {}) do
-        Learn.attackNames[nm] = true
+        if Learn.isHardIgnoredName(nm) then
+            table.insert(purged, nm)
+        else
+            Learn.attackNames[nm] = true
+        end
+    end
+    if #purged > 0 then
+        Log.add(string.format("Dropped %d saved attack name(s) that are on the ignore list", #purged))
+        Store.update("ignore-list cleanup", function(data)
+            local changed = false
+            for _, nm in ipairs(purged) do
+                if removeFromSavedList(data.safety, "learnedAttackNames", nm) then changed = true end
+            end
+            return changed
+        end)
     end
     for _, nm in ipairs(type(s.learnedIgnoreNames) == "table" and s.learnedIgnoreNames or {}) do
         Learn.ignoreNames[nm] = true
     end
 end
 
-local function addToSavedList(safety, listName, name)
-    safety[listName] = safety[listName] or {}
-    for _, nm in ipairs(safety[listName]) do
-        if nm == name then return false end   -- already saved
-    end
-    table.insert(safety[listName], name)
-    return true
-end
-
-local function removeFromSavedList(safety, listName, name)
-    local removed = false
-    for i = #(safety[listName] or {}), 1, -1 do
-        if safety[listName][i] == name then
-            table.remove(safety[listName], i)
-            removed = true
-        end
-    end
-    return removed
-end
-
 -- A death is rare and important: persist immediately, no batching. A name that killed us is no longer "harmless".
 function Learn.addAttackName(name)
-    if Learn.attackNames[name] then return end
+    if Learn.attackNames[name] or Learn.isHardIgnoredName(name) then return end   -- the ignore list always wins
     Learn.attackNames[name] = true
     Learn.ignoreNames[name] = nil
     Store.update("learned attack name", function(data)
@@ -1075,6 +1112,7 @@ Zones.active = {}      -- [part or model] = info
 Zones.ignored = setmetatable({}, { __mode = "k" })    -- parts/models confirmed not to be attacks (our own projectiles, scenery, expired hitboxes)
 Zones.seen = setmetatable({}, { __mode = "k" })       -- [top-level part] = when the orb scan first examined it
 Zones.suspects = setmetatable({}, { __mode = "k" })   -- [object] = { name, born, pos, damaged, attack }: what might have hurt us
+Zones.hardIgnored = setmetatable({}, { __mode = "k" })   -- objects on the hard ignore list (or inside one): see isHardIgnored
 Zones.lastScan = 0
 
 Zones.DURATION_PATTERNS = { "lifetime", "duration", "attackspeed", "attackduration", "activetime", "hitduration", "lifespan" }
@@ -1083,6 +1121,22 @@ Zones.configValues = nil    -- index of duration-like values in ReplicatedStorag
 Zones.configBuiltAt = 0
 
 -- ---- classification ----
+
+-- Is this object on the hard ignore list (Config.IGNORE_NAMES, e.g. the ground aura), or inside something that is?
+-- Such objects are invisible to the bot. Positive answers are remembered (and the object registered, so the wall
+-- raycasts can exclude it); a negative one is re-checked every time, since names and parents can change.
+function Zones.isHardIgnored(obj)
+    if Zones.hardIgnored[obj] then return true end
+    local cur = obj
+    while cur and cur ~= workspace do
+        if Learn.isHardIgnoredName(cur.Name) then
+            Zones.hardIgnored[obj] = true
+            return true
+        end
+        cur = cur.Parent
+    end
+    return false
+end
 
 function Zones.belongsToCharacter(obj)
     local cur = obj
@@ -1119,7 +1173,7 @@ end
 function Zones.rawKind(obj)
     local name = normalize(obj.Name)
 
-    -- a name that hurt us before always wins - even over the ignore rules below
+    -- a name that hurt us before is always an attack - but never one on the hard ignore list (checked in classify)
     if Learn.attackNames[name] then return "hitbox" end
     if Learn.isIgnoredName(name) then return nil end
 
@@ -1160,6 +1214,10 @@ end
 
 function Zones.classify(obj)
     if not obj:IsA("BasePart") or obj.ClassName == "Terrain" or Zones.ignored[obj] then return nil end
+    if Zones.isHardIgnored(obj) then
+        Zones.ignored[obj] = true   -- decided once: later scans skip it without even looking
+        return nil
+    end
     local kind = Zones.rawKind(obj)
     if kind and Zones.belongsToCharacter(obj) then return nil end   -- never our body, nor another player's
     return kind
@@ -1523,6 +1581,10 @@ end
 function Zones.addModel(model, initial)
     if not Config.MODEL_AS_ATTACK then return end
     if Zones.active[model] or Zones.ignored[model] or model.Parent ~= workspace then return end
+    if Zones.isHardIgnored(model) then
+        Zones.ignored[model] = true
+        return
+    end
     if Zones.belongsToCharacter(model) or model:FindFirstChildOfClass("Humanoid") then return end   -- bodies aren't attacks
     if Learn.isIgnoredName(normalize(model.Name)) then return end
 
@@ -1895,6 +1957,7 @@ function Zones.track(obj)
         p = p.Parent
     end
 
+    if Zones.isHardIgnored(obj) then return end   -- never remembered, so it can never be blamed for damage
     if Zones.belongsToCharacter(obj) then return end
     local dungeon = workspace:FindFirstChild("dungeon")
     if dungeon and obj:IsDescendantOf(dungeon) then return end   -- part of the dungeon itself, not a loose attack
@@ -2022,6 +2085,8 @@ function Walls.cast(origin, direction)
     if #Walls.mapParams.FilterDescendantsInstances == 0 then return a end
 
     local b = workspace:Raycast(origin, direction, Walls.mapParams)
+    -- the Include filter can't exclude anything, so a hard-ignored part inside the map is dropped from the result
+    if b and Zones.hardIgnored[b.Instance] then b = nil end
     if a and b then
         return (a.Distance <= b.Distance) and a or b
     end
@@ -2039,7 +2104,7 @@ function Walls.draw(map)
 
     -- SelectionBox has no on-screen cap (Highlight is limited to ~31), so enemy highlights stay visible
     for _, obj in ipairs(map:GetDescendants()) do
-        if obj:IsA("BasePart") then
+        if obj:IsA("BasePart") and not Zones.isHardIgnored(obj) then
             local s = Instance.new("SelectionBox")
             s.Adornee = obj
             s.Color3 = Color3.fromRGB(50, 100, 255)
@@ -2077,6 +2142,11 @@ function Walls.rebuildFilter()
 
     for part in pairs(Zones.active) do
         if part.Parent then table.insert(list, part) end
+    end
+
+    -- hard-ignored things (the ground aura ...) are visual effects: they must not read as walls or floor
+    for obj in pairs(Zones.hardIgnored) do
+        if obj.Parent then table.insert(list, obj) end
     end
 
     Walls.rayParams.FilterDescendantsInstances = list
