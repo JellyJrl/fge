@@ -9,6 +9,8 @@
       2. SURVIVE    Planner   a space-time search over the whole arena: every attack at once, each with its own timing,
                               plus walls and the npcs' own bodies. It finds the quickest way to a spot that stays safe,
                               and re-plans ten times a second. While nothing threatens us it stays put.
+                              In a fight the bot never stands still: it circles its target (the Move switch), so an attack
+                              aimed at where it stands lands where it WAS, and every dodge starts from a run.
                               After a respawn the 5s immortality is used: attacks that end before it does are ignored, the
                               rest only count from when it ends, so the bot sprints in, attacks, and is clear in time.
       3. CLEAR      Dungeon   rooms in order: fight the room's npcs, then walk to the next room, until none are left.
@@ -17,7 +19,9 @@
                               npcs ignore anyone outside their aggro range, so those are fought from inside it.
 
     Dying less:  attacks are padded more when our health is low, and when something hits us that we didn't see coming;
-                 the part that appeared right before such a hit is remembered (this run only) as an attack.
+                 the part that appeared right before such a hit is remembered as an attack for this run. If we DIE to
+                 something that was never registered as an attack, the part that was touching us is saved to
+                 AutoCombat/attacks.json (executor file access) and is an attack from then on, in every later run.
                  While fighting one group, the bot stays out of the aggro range of the others.
 
     One file, a few module tables:
@@ -32,6 +36,7 @@ local PathfindingService = game:GetService("PathfindingService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
 local clock = os.clock
@@ -53,6 +58,15 @@ local Config = {
     -- ---- fighting distances (studs) ----
     MIN_DISTANCE        = 7,     -- never closer than this to an npc's body
     ATTACK_RANGE        = 90,    -- how far the attack skill is assumed to reach (to an npc's CENTRE); calibrated while fighting
+    KEEP_MOVING         = true,  -- never stand still in a fight: circle the target (see Bot.strafeStep). Also the Move switch
+    STRAFE_LENGTH       = 14,    -- studs of each straight lane
+    STRAFE_HOLD         = 1.0,   -- the far end of a lane must stay clear this long after we get there
+    STRAFE_RATE         = 0.12,  -- choose the lane again this often
+    STRAFE_BAND         = 7,     -- stay within this many studs of the stand ring (less than BACKOFF, so it never triggers a reposition)
+    STRAFE_KEEP         = 1.0,   -- how much a lane that carries on the way we are running is preferred
+    STRAFE_FLIP_MIN     = 7,     -- circle one way round for this long at least (a turn-round costs momentum)...
+    STRAFE_FLIP_MAX     = 14,    -- ...and at most, then reverse
+    STRAFE_TURN         = 0.8,   -- a turn-round takes this long to commit to
     BACKOFF             = 10,    -- while fighting, back off to the stand ring when this much closer than it
     RANGE_MARGIN        = 6,     -- stand this far inside the cast range
     USE_AGGRO_RANGE     = true,  -- npcs only react to someone inside their `aggroRange`: stand and cast inside it
@@ -80,9 +94,11 @@ local Config = {
     PLAN_RADIUS         = 9,     -- cells searched around us (x GRID studs)
     PLAN_RADIUS_MAX     = 14,    -- ...widened to this when no safe spot is found
     PLAN_RATE           = 0.1,   -- re-plan this often while threatened
+    PLAN_BUDGET         = 0.004, -- seconds a single plan may take (it is cut short, never allowed to stall a frame)
     HORIZON             = 2.5,   -- how far ahead we look for something that will hit where we stand
     SETTLE              = 1.5,   -- a spot we stop at must stay safe this long after we arrive
     NEXT_MIN            = 4.5,   -- head for the first point of the plan this far away (not the very next cell: it would be reached too soon)
+    ACCEL               = 100,   -- studs/s^2 the character speeds up / turns with (a standing start costs speed/(2*ACCEL) seconds)
     REACTION            = 0.15,  -- input / humanoid delay added to every travel-time estimate
     HIT_COST            = 6,     -- walking through a live attack costs this many seconds of walking per cell (never forbidden)
     PLAN_STICK          = 0.5,   -- a re-plan keeps the previous destination unless another is this many seconds better...
@@ -117,7 +133,22 @@ local Config = {
     SURPRISE_DECAY      = 0.05,  -- ...fading by this per second
     SUSPECT_WINDOW      = 1.5,   -- parts that appeared this recently before an unseen hit are suspects
     SUSPECT_RADIUS      = 30,    -- ...if they were this close to us
-    SUSPECT_HITS        = 2,     -- a suspect that is near two unseen hits is treated as an attack for the rest of this run
+    SUSPECT_HITS        = 2,     -- a suspect that adds up to this many unseen hits is treated as an attack for the rest of this run
+    SUSPECT_WEAK        = 0.34,  -- ...an unseen hit counts this much for a part that merely appeared nearby (1 for one that was touching us)
+
+    -- Learning from deaths: the part that was touching us at the unexplained hits before a death is saved as an attack.
+    LEARN_PERSIST       = true,  -- keep it in a file (needs the executor's writefile / readfile); false = this run only
+    LEARN_FILE          = "AutoCombat/attacks.json",
+    LEARN_VERSION       = 1,
+    LEARN_MAX           = 200,   -- at most this many saved attacks (the oldest go first)
+    LEARN_MARGIN        = 4,     -- "touching us" = within this many studs of the part's box
+    LEARN_MIN_SIZE      = 2.5,   -- smaller parts are effects, not hitboxes
+    DEATH_BLAME_WINDOW  = 3,     -- an unexplained hit counts for a death this many seconds later
+    OWN_EFFECT_WINDOW   = 0.8,   -- a part appearing this soon after one of our casts, next to us, may be that cast's effect
+    -- names too bare to mean anything on their own: saved together with the part's size
+    GENERIC_NAMES       = { "part", "meshpart", "union", "unionoperation", "wedge", "wedgepart", "cornerwedge", "cornerwedgepart", "truss",
+                            "trusspart", "block", "brick", "cylinder", "ball", "sphere", "cone", "handle", "effect", "effects", "mesh",
+                            "model", "folder", "primarypart", "root", "rootpart", "base", "main", "default" },
 
     -- ---- movement ----
     REPATH_RATE         = 0.5,
@@ -195,6 +226,7 @@ local State = {
     wasEnabled = true,
     esp = Config.ESP,
     aim = Config.AUTO_AIM,
+    moveOn = Config.KEEP_MOVING,   -- the Move switch
     mode = "IDLE",
     char = nil, hum = nil, hrp = nil,
     wasAlive = true,
@@ -809,12 +841,18 @@ Hazards.nameCache = {}                                 -- raw name -> on the ign
 Hazards.nameCount = 0
 Hazards.lastScan = 0
 
--- dying less: padding grows with low health and with hits we didn't see coming (this run only, never saved)
+-- dying less: padding grows with low health and with hits we didn't see coming
 Hazards.extraPad = 0
 Hazards.surprise = 0
-Hazards.recent = {}      -- parts that just appeared: { name, raw, pos, t } - suspects when something unseen hits us
-Hazards.suspects = {}    -- [normalized name] = unseen hits it was near
-Hazards.learned = {}     -- [normalized name] = true: treated as an attack for the rest of this run
+Hazards.recent = {}      -- parts that just appeared: { name, raw, obj, cf, size, pos, t, body } - suspects when something unseen hits us
+Hazards.suspects = {}    -- [normalized name] = how suspicious it is (unseen hits it was at, weighted: touching us counts most)
+Hazards.learned = {}     -- [normalized name] = true: treated as an attack (learned this run, or saved from an earlier death)
+Hazards.sized = {}       -- [normalized name] = { {size}, ... }: generic names ("Part") count as an attack only at these sizes
+Hazards.saved = {}       -- [key] = entry: what attacks.json holds (a death we couldn't explain, and what we blamed)
+Hazards.runLearned = 0   -- names learned by the 2-hit rule this run
+Hazards.pendingDeath = nil   -- { t, strong = { [key] = entry } }: the unexplained hits just before a possible death
+Hazards.appearances = {}     -- [normalized name] = { near, other }: how often a part of that name appeared right after one of our casts
+Hazards.appearCount = 0
 
 function Hazards.pad()
     return Config.PADDING + Hazards.extraPad
@@ -891,9 +929,17 @@ function Hazards.looksLikeOrb(obj, name)
     return false
 end
 
-function Hazards.kindOf(obj)
+function Hazards.kindOf(obj, initial)
     local name = normalize(obj.Name)
-    if Hazards.learned[name] then return "hitbox" end   -- blamed for hits we didn't see coming (this run)
+    -- blamed for hits / deaths we didn't see coming (not for parts that were already there when we started: an attack is
+    -- created fresh, scenery that merely shares its name is not it)
+    if not initial and Hazards.knownAttack(name, obj.Size) then
+        if Hazards.ownEffect(name) or Hazards.ownEffect(Hazards.bareName(name)) then   -- ...unless it turns out to be what our own casts leave behind
+            Hazards.unlearn(name)
+            return nil
+        end
+        return "hitbox"
+    end
     if name:find("precast", 1, true) then return "precast" end
     if name:find("hitbox", 1, true) then return "hitbox" end
 
@@ -920,14 +966,14 @@ function Hazards.kindOf(obj)
     return nil
 end
 
-function Hazards.classify(obj)
+function Hazards.classify(obj, initial)
     if not obj:IsA("BasePart") or obj.ClassName == "Terrain" or Hazards.skip[obj] then return nil end
     if obj.Name:sub(1, 1) == "_" then return nil end   -- everything this script draws is named with a leading underscore
     if Hazards.isIgnored(obj) then
         Hazards.skip[obj] = true   -- decided once: later scans skip it without even looking
         return nil
     end
-    local kind = Hazards.kindOf(obj)
+    local kind = Hazards.kindOf(obj, initial)
     if kind and Hazards.inCharacter(obj) then return nil end   -- never our body, nor another player's
     return kind
 end
@@ -1017,7 +1063,7 @@ function Hazards.add(obj, initial, fromEvent)
         Hazards.expired[obj] = nil         -- the game re-added it: a new life of a reused part
     end
 
-    local kind = Hazards.classify(obj)
+    local kind = Hazards.classify(obj, initial)
     if not kind then return end
 
     local zone = Hazards.newZone(obj, kind, initial, obj.CFrame, obj.Size, false)
@@ -1055,11 +1101,12 @@ function Hazards.addModel(model, initial)
         return
     end
 
-    local zone = Hazards.newZone(model, "unknown", false, cf, size, true)
+    local known = Hazards.knownAttack(normalize(model.Name), size)
+    local zone = Hazards.newZone(model, known and "hitbox" or "unknown", false, cf, size, true)
     Hazards.active[model] = zone
     State.ignoreDirty = true
     ESP.attach(zone)
-    Log.add("model: " .. model.Name)
+    Log.add((known and "hitbox: " or "model: ") .. model.Name)
     Hazards.watch(model)
 end
 
@@ -1109,6 +1156,7 @@ function Hazards.refreshGeometry(obj, zone)
 end
 
 function Hazards.update(now)
+    Hazards.trackRecent(now)
     for obj, zone in pairs(Hazards.active) do
         if not obj.Parent then
             Hazards.remove(obj)
@@ -1135,7 +1183,7 @@ function Hazards.update(now)
                     zone.nextResolve = now + 0.1
                     Hazards.resolve(zone, now)
                 end
-                if zone.duration and age >= zone.duration + 0.05 then
+                if zone.duration and age >= zone.duration + Config.PRECAST_SAFETY + 0.05 then   -- (its window already counts the safety margin)
                     Hazards.expire(obj)
                 end
             elseif zone.kind == "unknown" and age > Config.UNKNOWN_MAX_AGE then
@@ -1165,20 +1213,71 @@ function Hazards.scan(now)
     end
 end
 
--- remembered for a moment: if something we never saw coming hits us, one of these is probably it
+-- is this part (part of) a body - a character, an npc? Bodies are never attacks.
+local function inBody(obj)
+    local cur = obj.Parent
+    while cur and cur ~= workspace do
+        if cur:IsA("Model") and cur:FindFirstChildOfClass("Humanoid") then return true end
+        cur = cur.Parent
+    end
+    return false
+end
+
+-- Our own skills leave effect parts next to us. A name that only ever appears right after one of our casts is OUR effect, not an
+-- attack (see ownEffect); an enemy's attack shows up at other times too. Counted for every new part, attack or not.
+function Hazards.countAppearance(obj)
+    if obj.Name:sub(1, 1) == "_" then return end
+    local name = normalize(obj.Name)
+    local stat = Hazards.appearances[name]
+    if not stat then
+        Hazards.appearCount = Hazards.appearCount + 1
+        if Hazards.appearCount > 600 then Hazards.appearances, Hazards.appearCount = {}, 1 end
+        stat = { near = 0, other = 0 }
+        Hazards.appearances[name] = stat
+    end
+    if State.hrp and clock() - Skills.castAt <= Config.OWN_EFFECT_WINDOW and flat(obj.Position - State.hrp.Position).Magnitude <= Config.OWN_RADIUS then
+        stat.near = stat.near + 1
+    else
+        stat.other = stat.other + 1
+    end
+end
+
+-- remembered for a moment: if something we never saw coming hits us, one of these is probably it. What it looked like
+-- (position, size) is kept up to date while it exists, so even a projectile that vanished on impact can be matched to us.
 function Hazards.noteRecent(obj)
     if obj.Name:sub(1, 1) == "_" or Hazards.active[obj] or Hazards.isIgnored(obj) or Hazards.inCharacter(obj) then return end
-    table.insert(Hazards.recent, { name = normalize(obj.Name), raw = obj.Name, pos = obj.Position, t = clock() })
+    -- an attack that is a loose Model dropped into workspace is best known by the Model's name, not by its parts'
+    local top = obj
+    while top.Parent and top.Parent ~= workspace do top = top.Parent end
+    local topName = (top ~= obj and top:IsA("Model") and top.Parent == workspace) and top.Name or nil
+    local name = normalize(obj.Name)
+    table.insert(Hazards.recent, {
+        name = name, raw = obj.Name, obj = obj, cf = obj.CFrame, size = obj.Size, pos = obj.Position,
+        t = clock(), body = inBody(obj), cls = obj.ClassName, topName = topName,
+    })
     if #Hazards.recent > 60 then table.remove(Hazards.recent, 1) end
+end
+
+function Hazards.trackRecent(now)
+    for i = #Hazards.recent, 1, -1 do
+        local r = Hazards.recent[i]
+        if now - r.t > 4 then
+            table.remove(Hazards.recent, i)
+        elseif r.obj.Parent then
+            r.cf, r.size, r.pos = r.obj.CFrame, r.obj.Size, r.obj.Position
+        end
+    end
 end
 
 function Hazards.onAdded(obj)
     if obj:IsA("BasePart") then
+        Hazards.countAppearance(obj)
         Hazards.add(obj, nil, true)
         Hazards.noteRecent(obj)
     elseif obj:IsA("Model") or obj:IsA("Folder") then
         for _, d in ipairs(obj:GetDescendants()) do
             if d:IsA("BasePart") then
+                Hazards.countAppearance(d)
                 Hazards.add(d, nil, true)
                 Hazards.noteRecent(d)
             end
@@ -1188,8 +1287,12 @@ function Hazards.onAdded(obj)
 end
 
 function Hazards.start()
+    Hazards.loadSaved()
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("BasePart") then pcall(Hazards.add, obj, true) end
+        if obj:IsA("BasePart") then
+            pcall(Hazards.add, obj, true)
+            Hazards.seen[obj] = -1000   -- already there: the young-part re-check (orbs gaining a Trail) is not for it
+        end
     end
     track(workspace.DescendantAdded:Connect(function(obj)
         local ok, err = pcall(Hazards.onAdded, obj)
@@ -1197,26 +1300,259 @@ function Hazards.start()
     end))
 end
 
--- We were hit and no zone explains it. Every part that appeared near us just before is a suspect; one that is near two
--- such hits is treated as an attack for the rest of this run. Returns the suspects' names (for the log).
+-- is `pos` touching the part `r` describes (inside its box, `margin` studs to spare)?
+local function touching(r, pos, margin)
+    local l = r.cf:PointToObjectSpace(pos)
+    local half = r.size / 2
+    return math.abs(l.X) <= half.X + margin and math.abs(l.Z) <= half.Z + margin and math.abs(l.Y) <= half.Y + margin + Config.VERTICAL
+end
+
+-- We were hit and no zone explains it. Every part that appeared near us just before is a suspect, and one that was
+-- actually touching us counts far more than one that merely appeared nearby. A suspect that adds up to SUSPECT_HITS is
+-- treated as an attack for the rest of this run. Those touching us are also remembered for a few seconds: if this hit
+-- turns out to be the one that kills us, they are saved (Hazards.onDeath). Returns the suspects' names (for the log).
 function Hazards.blame(pos)
     local now = clock()
-    local names, order, seen = {}, {}, {}
+    local order, seen = {}, {}
+    local pending = Hazards.pendingDeath
+    if not pending or now - pending.t > Config.DEATH_BLAME_WINDOW then
+        pending = { t = now, strong = {} }
+        Hazards.pendingDeath = pending
+    end
+    pending.t = now
+
     for _, r in ipairs(Hazards.recent) do
-        if now - r.t <= Config.SUSPECT_WINDOW and flat(pos - r.pos).Magnitude <= Config.SUSPECT_RADIUS
-            and not seen[r.name] and not Hazards.learned[r.name] then
-            seen[r.name] = true
-            table.insert(order, r.raw)
-            Hazards.suspects[r.name] = (Hazards.suspects[r.name] or 0) + 1
-            if Hazards.suspects[r.name] >= Config.SUSPECT_HITS then
-                Hazards.learned[r.name] = true
-                Hazards.skip = setmetatable({}, { __mode = "k" })   -- everything gets a fresh look under the new name
-                Log.add("Learned attack (this run): " .. r.raw)
+        if now - r.t <= Config.SUSPECT_WINDOW and not r.body and flat(pos - r.pos).Magnitude <= Config.SUSPECT_RADIUS
+            and not Hazards.knownAttack(r.name, r.size) and not Hazards.ownEffect(r.name) then
+            local hit = touching(r, pos, Config.LEARN_MARGIN)
+            if not seen[r.name] then
+                seen[r.name] = true
+                table.insert(order, r.raw)
+                Hazards.suspects[r.name] = (Hazards.suspects[r.name] or 0) + (hit and 1 or Config.SUSPECT_WEAK)
+                if Hazards.suspects[r.name] >= Config.SUSPECT_HITS then
+                    Hazards.learn(r.name, r.size, r.raw)
+                    Hazards.runLearned = Hazards.runLearned + 1
+                    Log.add("Learned attack (this run): " .. r.raw)
+                end
+            end
+            if hit and Hazards.canRegister(r) then
+                local entry = Hazards.entryOf(r)
+                pending.strong[entry.key] = entry
             end
         end
     end
     Hazards.surprise = math.min(Config.SURPRISE_MAX, Hazards.surprise + Config.SURPRISE_PAD)
     return order
+end
+
+-- ---- learning from deaths ----
+-- Dying to something that was never registered as an attack is the most expensive way to find out about it. So the part
+-- that was touching us when the unexplained hits landed is saved to attacks.json, and counted as an attack from then on -
+-- right away, and in every later run. Only ATTACKS are ever saved (never "harmless" lists: a bad entry costs some dodging,
+-- it can never hide a real attack), and the entry has to survive some checks: not on the ignore list, not part of a body, not
+-- a bare default name like "Part" (those are only matched together with their size).
+
+local function similar(a, b)
+    return math.abs(a.X - b.X) <= 0.15 * math.max(a.X, b.X) + 0.5 and math.abs(a.Y - b.Y) <= 0.15 * math.max(a.Y, b.Y) + 0.5
+        and math.abs(a.Z - b.Z) <= 0.15 * math.max(a.Z, b.Z) + 0.5
+end
+
+function Hazards.isGeneric(name)
+    if #name < 3 or name:match("^%d+$") then return true end
+    local bare = name:gsub("%d+$", "")
+    for _, g in ipairs(Config.GENERIC_NAMES) do
+        if bare == g then return true end
+    end
+    return false
+end
+
+-- learned (this run, or saved from an earlier death), by name - or by name and size for the bare ones
+function Hazards.knownAttack(name, size)
+    if Hazards.learned[name] or Hazards.sizedMatch(name, size) then return true end
+    local bare = Hazards.bareName(name)
+    return bare ~= name and (Hazards.learned[bare] or Hazards.sizedMatch(bare, size)) or false
+end
+
+-- is `name` at this size an attack we learned about as a generic name?
+function Hazards.sizedMatch(name, size)
+    local list = Hazards.sized[name]
+    if not list then return false end
+    for _, e in ipairs(list) do
+        if similar(size, e) then return true end
+    end
+    return false
+end
+
+-- a name that only ever appears right after our own casts (3 times or more, and never at any other time) is our skill's effect
+function Hazards.ownEffect(name)
+    local stat = Hazards.appearances[name]
+    return stat ~= nil and stat.near >= 3 and stat.other == 0
+end
+
+-- may this part be saved as an attack at all?
+function Hazards.canRegister(r)
+    if r.body or #r.name == 0 or #r.name > 40 or Hazards.ownEffect(r.name) then return false end
+    if Hazards.nameIgnored(r.raw) then return false end
+    return math.max(r.size.X, r.size.Z) >= Config.LEARN_MIN_SIZE
+end
+
+-- the name an attack is known by: its loose Model's name when it has a proper one, else the part's; trailing numbers
+-- ("Spike17") are dropped so every copy of it matches
+function Hazards.bareName(name)
+    local bare = name:gsub("%d+$", "")
+    return #bare >= 4 and bare or name
+end
+
+function Hazards.entryOf(r)
+    local raw, name = r.raw, r.name
+    if r.topName then
+        local top = normalize(r.topName)
+        if not Hazards.isGeneric(top) and top ~= "dungeon" and top ~= "map" then raw, name = r.topName, top end
+    end
+    name = Hazards.bareName(name)
+    local generic = Hazards.isGeneric(name)
+    local size = { math.floor(r.size.X * 10 + 0.5) / 10, math.floor(r.size.Y * 10 + 0.5) / 10, math.floor(r.size.Z * 10 + 0.5) / 10 }
+    return {
+        key = generic and (name .. "@" .. size[1] .. "x" .. size[2] .. "x" .. size[3]) or name,
+        name = name, raw = raw, size = size, match = generic and "size" or "name", kills = 1, t = os.time(),
+    }
+end
+
+-- count it as an attack from now on (without saving anything)
+function Hazards.learn(name, size, raw)
+    if Hazards.isGeneric(name) then
+        Hazards.sized[name] = Hazards.sized[name] or {}
+        table.insert(Hazards.sized[name], Vector3.new(size.X, size.Y, size.Z))
+    else
+        Hazards.learned[name] = true
+    end
+    Hazards.skip = setmetatable({}, { __mode = "k" })   -- everything gets a fresh look under the new name
+end
+
+function Hazards.canPersist()
+    return Config.LEARN_PERSIST and type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+end
+
+function Hazards.savedCount()
+    local n = 0
+    for _ in pairs(Hazards.saved) do n = n + 1 end
+    return n
+end
+
+function Hazards.writeSaved()
+    if not Hazards.canPersist() then return end
+    local list = {}
+    for _, e in pairs(Hazards.saved) do
+        table.insert(list, { name = e.name, raw = e.raw, size = e.size, match = e.match, kills = e.kills, t = e.t })
+    end
+    table.sort(list, function(a, b) return (a.t or 0) > (b.t or 0) end)
+    while #list > Config.LEARN_MAX do table.remove(list) end
+    local ok, err = pcall(function()
+        local text = HttpService:JSONEncode({ version = Config.LEARN_VERSION, attacks = list })
+        if type(isfolder) == "function" and type(makefolder) == "function" then
+            local folder = Config.LEARN_FILE:match("^(.*)/[^/]*$")
+            if folder and not isfolder(folder) then makefolder(folder) end
+        end
+        writefile(Config.LEARN_FILE, text)
+    end)
+    if not ok then Log.add("couldn't save attacks: " .. tostring(err):sub(1, 50)) end
+end
+
+-- registers an entry as a saved attack (and counts it as one now). Returns true when it was new or reinforced.
+function Hazards.register(entry)
+    local have = Hazards.saved[entry.key]
+    if have then
+        have.kills, have.t = have.kills + 1, entry.t
+    else
+        if Hazards.savedCount() >= Config.LEARN_MAX then
+            local oldest, oldestKey = math.huge, nil
+            for k, e in pairs(Hazards.saved) do
+                if (e.t or 0) < oldest then oldest, oldestKey = e.t or 0, k end
+            end
+            if oldestKey then Hazards.saved[oldestKey] = nil end
+        end
+        Hazards.saved[entry.key] = entry
+    end
+    Hazards.learn(entry.name, Vector3.new(entry.size[1], entry.size[2], entry.size[3]), entry.raw)
+    return true
+end
+
+-- the character just died: if the unexplained hits right before it were touching something new, that is what killed us
+function Hazards.onDeath()
+    local d = Hazards.pendingDeath
+    Hazards.pendingDeath = nil
+    if not d or clock() - d.t > Config.DEATH_BLAME_WINDOW then return end
+    local names = {}
+    for _, entry in pairs(d.strong) do
+        if Hazards.register(entry) then table.insert(names, entry.raw) end
+    end
+    if #names > 0 then
+        Log.add("Died to something unregistered - now an attack: " .. table.concat(names, ", "):sub(1, 60))
+        Hazards.writeSaved()
+    else
+        Log.add("Died to something unseen - nothing was close enough to blame")
+    end
+end
+
+-- load what earlier runs saved (anything unreadable is ignored, never overwritten until there is something new to save)
+function Hazards.loadSaved()
+    if not Hazards.canPersist() then return end
+    local ok, text = pcall(function()
+        if isfile(Config.LEARN_FILE) then return readfile(Config.LEARN_FILE) end
+    end)
+    if not ok or not text then return end
+    local okJson, data = pcall(function() return HttpService:JSONDecode(text) end)
+    if not okJson or type(data) ~= "table" or data.version ~= Config.LEARN_VERSION or type(data.attacks) ~= "table" then
+        Log.add("attacks.json isn't readable - ignored")
+        return
+    end
+    local n = 0
+    for _, e in ipairs(data.attacks) do
+        if n >= Config.LEARN_MAX then break end
+        if type(e) == "table" and type(e.name) == "string" and e.name:match("^%w+$") and #e.name <= 40 and type(e.size) == "table"
+            and type(e.size[1]) == "number" and type(e.size[2]) == "number" and type(e.size[3]) == "number"
+            and not Hazards.nameIgnored(e.raw or e.name) then
+            local entry = {
+                key = (e.match == "size") and (e.name .. "@" .. e.size[1] .. "x" .. e.size[2] .. "x" .. e.size[3]) or e.name,
+                name = e.name, raw = type(e.raw) == "string" and e.raw:sub(1, 40) or e.name, size = { e.size[1], e.size[2], e.size[3] },
+                match = (e.match == "size") and "size" or "name", kills = tonumber(e.kills) or 1, t = tonumber(e.t) or 0,
+            }
+            if entry.match == "size" or not Hazards.isGeneric(entry.name) then   -- (a bare generic name is never trusted on its own)
+                Hazards.saved[entry.key] = entry
+                Hazards.learn(entry.name, Vector3.new(entry.size[1], entry.size[2], entry.size[3]), entry.raw)
+                n = n + 1
+            end
+        end
+    end
+    if n > 0 then Log.add(string.format("Loaded %d saved attack(s) from earlier deaths", n)) end
+end
+
+-- a name that was learned (or saved) by mistake: it is not an attack
+function Hazards.unlearn(name)
+    local bare = Hazards.bareName(name)
+    Hazards.learned[name], Hazards.learned[bare], Hazards.sized[name], Hazards.sized[bare] = nil, nil, nil, nil
+    local changed = false
+    for key, e in pairs(Hazards.saved) do
+        if e.name == name or e.name == bare then
+            Hazards.saved[key] = nil
+            changed = true
+        end
+    end
+    Log.add(name .. " only appears after our own casts - not an attack, forgotten")
+    if changed then Hazards.writeSaved() end
+end
+
+-- throw away everything learned (this run's and the saved file)
+function Hazards.forgetAll()
+    Hazards.learned, Hazards.sized, Hazards.saved, Hazards.suspects = {}, {}, {}, {}
+    Hazards.runLearned, Hazards.pendingDeath = 0, nil
+    Hazards.skip = setmetatable({}, { __mode = "k" })
+    pcall(function()
+        if type(isfile) == "function" and isfile(Config.LEARN_FILE) then
+            if type(delfile) == "function" then delfile(Config.LEARN_FILE) else writefile(Config.LEARN_FILE, "") end
+        end
+    end)
+    Log.add("Forgot every learned attack")
 end
 
 -- ---- when does it hurt? ----
@@ -1395,6 +1731,7 @@ function Hazards.counts(now)
     end
     return c
 end
+
 
 -- =====================
 -- WALLS: raycasts against the map
@@ -1697,8 +2034,52 @@ local function lookahead(list, path, speed)
     return chosen
 end
 
+-- Keeping moving. A real player never stands still in a fight: a precast lands where we WERE, and a dodge from a run is
+-- quicker than one from a standstill. So instead of picking a place to stop, pick the best straight LANE to run along:
+-- `length` studs in one of 16 directions, usable when nothing hits any point of it as we pass, its far end stays clear for
+-- `hold` more seconds, no wall or gap is in the way and opts.accept(end) agrees (the fight's own rules: the distance band,
+-- other groups' aggro, a boss's area ...), and opts.passable(point) agrees about the middle of it. opts.score(dir, end) says
+-- which is best. Returns the usable lanes, best first:
+-- { dir, goal, score }.
+local LANE_DIRS = 16
+function Planner.strafe(opts)
+    local from, speed = opts.from, opts.speed
+    local length, hold = opts.length, opts.hold
+    local pad = Hazards.pad()
+    local travel = length / speed
+    local list = compile(opts.windows, from, pad, travel + hold + 0.5, length + 14)
+    local steps = math.max(2, math.floor(length / 2.5))
+    local out = {}
+
+    for k = 0, LANE_DIRS - 1 do
+        local ang = k * (2 * math.pi / LANE_DIRS)
+        local dx, dz = math.cos(ang), math.sin(ang)
+        local ok = true
+        for i = 1, steps do   -- every point of the lane, at the moment we would pass it
+            local f = i / steps
+            local t = travel * f
+            if hitAt(list, from.X + dx * length * f, from.Z + dz * length * f, t - 0.15, t + 0.15) then
+                ok = false
+                break
+            end
+        end
+        local goal = Vector3.new(from.X + dx * length, from.Y, from.Z + dz * length)
+        if ok and hitAt(list, goal.X, goal.Z, travel, travel + hold) then ok = false end
+        if ok then   -- the middle of the lane: no npc's body, and ground under it (a pit shorter than the lane would be missed otherwise)
+            local mid = Vector3.new(from.X + dx * length * 0.5, from.Y, from.Z + dz * length * 0.5)
+            if not opts.passable(mid) or not Walls.floorBelow(mid) then ok = false end
+        end
+        if ok and opts.accept(goal) and Walls.stepClear(from, goal) then
+            local dir = Vector3.new(dx, 0, dz)
+            table.insert(out, { dir = dir, goal = goal, score = opts.score(dir, goal) })
+        end
+    end
+    table.sort(out, function(a, b) return a.score > b.score end)
+    return out
+end
+
 -- opts: from, speed, windows (Hazards.windows), penalty(pos) -> extra seconds-equivalent cost of stopping there,
---       radius (cells). Returns { path = {Vector3...}, arrival, safe, slack, visited } or nil.
+--       radius (cells), velocity (how we are moving now: momentum helps the first step). Returns { path = {Vector3...}, arrival, safe, slack, visited } or nil.
 function Planner.plan(opts)
     local from, speed, now = opts.from, opts.speed, clock()
     local R = opts.radius or Config.PLAN_RADIUS
@@ -1707,13 +2088,15 @@ function Planner.plan(opts)
     local penalty = opts.penalty
     local list = compile(opts.windows, from, pad, settle + Config.HORIZON, R * G + 6)
     local y = from.Y
+    local vx, vz = 0, 0   -- how we are moving right now
+    if opts.velocity then vx, vz = opts.velocity.X, opts.velocity.Z end
 
     local startSurface = Npcs.surfaceDistance(from)
     local transitFloor = math.min(Config.MIN_DISTANCE, startSurface) - 0.1   -- never deeper into an npc than we already are
     local sx, sz = cellOf(from)
     local startKey = keyOf(sx, sz)
 
-    local nodes = { [startKey] = { cx = sx, cz = sz, t = 0, c = 0, h = 0, pos = from } }
+    local nodes = { [startKey] = { cx = sx, cz = sz, t = 0, c = 0, h = 0, pos = from, vx = vx, vz = vz } }
     local heap = {}
     heapPush(heap, { cost = 0, key = startKey })
     local closed, order = {}, {}
@@ -1726,6 +2109,7 @@ function Planner.plan(opts)
     local stick = Config.PLAN_STICK
     local stickR2 = Config.PLAN_STICK_RADIUS * Config.PLAN_STICK_RADIUS
 
+    local started = clock()
     while #heap > 0 do
         local top = heapPop(heap)
         local key = top.key
@@ -1734,6 +2118,8 @@ function Planner.plan(opts)
             local node = nodes[key]
             if node.c - stick > bestTotal then break end   -- penalties are never negative: nothing later can beat the best
             table.insert(order, node)
+            -- never hold up a frame: a plan that takes too long is cut short and the best spot found so far is used
+            if #order % 40 == 0 and clock() - started > Config.PLAN_BUDGET then break end
             local pos = node.pos
 
             -- a place to stop? it must stay safe, clear of the npcs, and suit the fight
@@ -1752,15 +2138,26 @@ function Planner.plan(opts)
                     local nk = keyOf(nx, nz)
                     if not closed[nk] then
                         local step = d[3] * G / speed
-                        local tn = node.t + step + (node.parent == nil and Config.REACTION or 0)
                         local npos = Vector3.new(nx * G, y, nz * G)
+                        local tn = node.t + step
+                        -- momentum: carrying on the way we are already running is free, starting from rest costs
+                        -- speed/(2*ACCEL), turning right round twice that (the first step also has the input delay)
+                        local sx_, sz_ = npos.X - node.pos.X, npos.Z - node.pos.Z
+                        local len = math.sqrt(sx_ * sx_ + sz_ * sz_)
+                        local ux, uz = 0, 0
+                        if len > 0.01 then
+                            ux, uz = sx_ / len, sz_ / len
+                            local along = math.clamp(node.vx * ux + node.vz * uz, -speed, speed)
+                            tn = tn + (speed - along) / (2 * Config.ACCEL)
+                        end
+                        if node.parent == nil then tn = tn + Config.REACTION end
                         -- never into an npc; through an attack only at a price
                         if Npcs.surfaceDistance(npos) >= transitFloor then
                             local hit = hitAt(list, npos.X, npos.Z, tn - step / 2, tn + step / 2)
                             local cn = node.c + (tn - node.t) + (hit and Config.HIT_COST or 0)
                             local old = nodes[nk]
                             if (not old or cn < old.c - 1e-6) and Planner.stepOk(node.cx, node.cz, nx, nz, pos, npos, now) then
-                                nodes[nk] = { cx = nx, cz = nz, t = tn, c = cn, h = node.h + (hit and 1 or 0), pos = npos, parent = node }
+                                nodes[nk] = { cx = nx, cz = nz, t = tn, c = cn, h = node.h + (hit and 1 or 0), pos = npos, parent = node, vx = ux * speed, vz = uz * speed }
                                 heapPush(heap, { cost = cn, key = nk })
                             end
                         end
@@ -2072,6 +2469,7 @@ Skills.attack = nil           -- name of the main attack
 Skills.reach = Config.ATTACK_RANGE   -- the longest reach among the attacks (to an npc's centre): where the bot stands
 Skills.busy = false
 Skills.castUntil = 0          -- attacks that appear before this, close to us, are our own
+Skills.castAt = -100          -- when we last used a skill
 Skills.attackNotBefore = 0
 Skills.lastAttack = -100
 Skills.lastAttackSkill = nil
@@ -2277,6 +2675,7 @@ end
 function Skills.use(tool, label, aim)
     if Skills.busy then return false end
     Skills.busy = true
+    Skills.castAt = clock()
     Skills.castUntil = clock() + Config.OWN_WINDOW
 
     task.spawn(function()
@@ -3312,7 +3711,7 @@ function UI.build()
     switches.Parent = body
     layout(switches, 6, true)
     local third = UDim2.new(1 / 3, -4, 1, 0)
-    local styleBot, styleEsp, styleAim
+    local styleBot, styleEsp, styleAim, styleMove
     styleBot = toggle(switches, third, function()
         State.enabled = not State.enabled
         Nav.setControls(not State.enabled)   -- bot on -> it takes the controls; off -> they come back
@@ -3328,27 +3727,47 @@ function UI.build()
         Log.add(State.aim and "Auto-aim on" or "Auto-aim off")
         UI.restyle()
     end)
+
+    -- second row: keep moving, the report, and forgetting what it learned
+    local switches2 = Instance.new("Frame")
+    switches2.Size = UDim2.new(1, 0, 0, 30)
+    switches2.BackgroundTransparency = 1
+    switches2.LayoutOrder = nextOrder(body)
+    switches2.Parent = body
+    layout(switches2, 6, true)
+    styleMove = toggle(switches2, third, function()
+        State.moveOn = not State.moveOn
+        if not State.moveOn then Nav.stop() end
+        Log.add(State.moveOn and "Keep moving on" or "Keep moving off (stands still in a fight)")
+        UI.restyle()
+    end)
     UI.restyle = function()
         styleBot("Bot", State.enabled)
         styleEsp("ESP", State.esp)
         styleAim("Aim", State.aim)
+        styleMove("Move", State.moveOn)
     end
     UI.restyle()
 
-    local dump = Instance.new("TextButton")
-    dump.Size = UDim2.new(1, 0, 0, 24)
-    dump.AutoButtonColor = false
-    dump.BorderSizePixel = 0
-    dump.BackgroundColor3 = UI.C.button
-    dump.TextColor3 = UI.C.dim
-    dump.Font = Enum.Font.GothamMedium
-    dump.TextSize = 12
-    dump.Text = "Print report to console"
-    dump.LayoutOrder = nextOrder(body)
-    dump.Parent = body
-    corner(dump, 7)
-    outline(dump, UI.C.line, 1, 0.3)
-    dump.MouseButton1Click:Connect(function() pcall(Bot.dump) end)
+    local function button(parent, text, onClick)
+        local b = Instance.new("TextButton")
+        b.Size = third
+        b.AutoButtonColor = false
+        b.BorderSizePixel = 0
+        b.BackgroundColor3 = UI.C.button
+        b.TextColor3 = UI.C.dim
+        b.Font = Enum.Font.GothamMedium
+        b.TextSize = 12
+        b.Text = text
+        b.LayoutOrder = nextOrder(parent)
+        b.Parent = parent
+        corner(b, 8)
+        outline(b, UI.C.line, 1, 0.2)
+        b.MouseButton1Click:Connect(onClick)
+        return b
+    end
+    button(switches2, "Report", function() pcall(Bot.dump) end)
+    UI.refs.forget = button(switches2, "Forget saved", function() pcall(Hazards.forgetAll) end)
 
     -- the dungeon
     local dungeon = card(body, "DUNGEON")
@@ -3381,6 +3800,7 @@ function UI.build()
     UI.refs.chipUnk = chip(chips, Hazards.COLORS.unknown, 4)
     UI.refs.threat = row(threats, "Status")
     UI.refs.threatBar = bar(threats)
+    UI.refs.learned = row(threats, "Learned")
 
     -- skills: one row per skill carried (hidden when unused)
     local skills = card(body, "SKILLS")
@@ -3523,6 +3943,7 @@ function UI.update()
         r.threat.Text = col(UI.C.green, "clear")
         setBar(r.threatBar, 0, UI.C.green)
     end
+    r.learned.Text = string.format("%d saved  /  %d this run", Hazards.savedCount(), Hazards.runLearned)
     local pad = Hazards.extraPad
     if pad > 0.05 then r.threat.Text = r.threat.Text .. col(UI.C.dim, string.format("  (+%.1f caution)", pad)) end
     if Hazards.shieldLeft > 0 then
@@ -3586,6 +4007,7 @@ Bot.lastNoPath = 0
 Bot.lastStep = nil
 Bot.lastUnseen = 0
 Bot.lastDetect = 0
+Bot.strafe = { spin = 1, flipAt = 0, last = -100, dir = nil }   -- the lane we are running along
 Bot.stopped = false
 
 -- one bad frame (a part vanishing mid-death ...) must never kill the loop or flood the output
@@ -3636,8 +4058,11 @@ end
 -- we didn't see coming: pad every attack more for a while, and remember what appeared just before as suspects.
 function Bot.onDamage(amount, pos)
     if amount < math.max(3, State.hum.MaxHealth * 0.03) then return end
-    if Hazards.nearby(pos, 4) > 0 then return end                       -- an attack we know of was right there
-    if Npcs.surfaceDistance(pos) < Config.MIN_DISTANCE + 4 then return end   -- an npc in melee range
+    -- an attack we know of was right there / an npc in melee range: that explains it (and it isn't what to learn from)
+    if Hazards.nearby(pos, 4) > 0 or Npcs.surfaceDistance(pos) < Config.MIN_DISTANCE + 4 then
+        Hazards.pendingDeath = nil
+        return
+    end
     local suspects = Hazards.blame(pos)
     local now = clock()
     if now - Bot.lastUnseen > 1 then
@@ -3685,6 +4110,7 @@ function Bot.onCharacter(char, initial)
         hum.Died:Connect(function()
             if State.wasAlive then
                 State.wasAlive = false
+                pcall(Hazards.onDeath)   -- was it something we never registered as an attack? then it is one from now on
                 State.deaths = State.deaths + 1
                 Bot.reset("Died (" .. State.deaths .. " so far)")
                 State.setMode("DEAD")
@@ -3846,6 +4272,12 @@ end
 -- ---- the things the bot can be doing ----
 
 -- Something will hit us, or an npc is on top of us: ask the planner for the way out and walk it.
+-- how we are moving right now (flat): momentum is what makes the next dodge quick
+function Bot.velocity()
+    local v = State.hrp.AssemblyLinearVelocity
+    return Vector3.new(v.X, 0, v.Z)
+end
+
 function Bot.dodgeStep(f)
     Nav.stopPath()
     ESP.clearPath()
@@ -3855,7 +4287,7 @@ function Bot.dodgeStep(f)
     if f.now - Bot.lastPlan >= Config.PLAN_RATE or not Nav.plan then
         Bot.lastPlan = f.now
         local function make(radius)
-            return Planner.plan({ from = me, speed = f.speed, windows = f.wins, penalty = f.penalty, radius = radius })
+            return Planner.plan({ from = me, speed = f.speed, windows = f.wins, penalty = f.penalty, radius = radius, velocity = Bot.velocity() })
         end
         local plan = make(Config.PLAN_RADIUS)
         if plan and not plan.safe then plan = make(Config.PLAN_RADIUS_MAX) or plan end   -- nothing safe near: look further
@@ -3932,7 +4364,103 @@ function Bot.approachStep(f)
     end
 end
 
--- inside the cast range and nothing threatening: stay put; move only when something is wrong with where we are
+-- ---- keeping moving ----
+-- A real player never stands still in a fight: an attack aimed at where we are lands where we WERE, and a dodge from a run
+-- is quicker than one from a standstill (we already have the momentum). So inside the cast range, with nothing threatening,
+-- the bot circles its target: every STRAFE_RATE seconds it picks the best straight lane (Planner.strafe) - clear of every
+-- attack as it passes, inside the distance band around the ring, away from walls, out of other groups' aggro, inside a
+-- boss's area - preferring to carry on the way it is running and to keep circling the same way round, and reverses the
+-- circling now and then. Skills fire as usual: the bot keeps facing the target while it runs.
+function Bot.strafeOn()
+    return Config.KEEP_MOVING and State.moveOn
+end
+
+function Bot.strafeStep(f, relaxed)
+    local st = Bot.strafe
+    local now = f.now
+    local me = State.hrp.Position
+    if not f.forceReplan and Nav.goal and now - st.last < Config.STRAFE_RATE then return end
+    st.last = now
+
+    local group = f.group
+    local near, nearDist = Npcs.nearestCenter(me, Npcs.pool)
+    if not near then
+        Nav.stop()
+        return
+    end
+    local ring = f.ring or Nav.ringRadius(group, f.barrier)
+    local lowest = math.max(group.radius + Config.BIG_BODY_GAP, Config.MIN_DISTANCE + 6)
+    local lo = math.max(lowest, ring - Config.STRAFE_BAND)
+    local hi = math.max(lo, math.min(f.range * 0.93, ring + Config.STRAFE_BAND))
+    if f.barrier or relaxed then   -- slide along a barrier / nothing better to be had: just don't drift far from where we are
+        lo, hi = math.max(lowest, nearDist - 6), math.min(f.range * 0.97, nearDist + 6)
+    end
+    local area = (group.boss and not f.barrier and group.room) and Dungeon.boundsOf(group.room) or nil
+    local pullHere = Bot.pullCost(me, group)
+
+    local function accept(pos)
+        local _, d = Npcs.nearestCenter(pos, Npcs.pool)
+        if d < lo or d > hi then return false end
+        if Npcs.surfaceDistance(pos) < Config.MIN_DISTANCE + 2 then return false end
+        if area and not Dungeon.within(area, pos, -Config.BOSS_AREA_MARGIN) then return false end
+        if pullHere == 0 and Bot.pullCost(pos, group) > 0 then return false end
+        return true
+    end
+
+    -- circle the target: the radial direction (from it to us) and the tangent we are circling along
+    local radial = flat(me - near.pos)
+    local rUnit = radial.Magnitude > 0.1 and radial.Unit or Vector3.new(1, 0, 0)
+    local v = Bot.velocity()
+    local heading = (v.Magnitude > 3 and v.Unit) or st.dir or Vector3.new(-rUnit.Z, 0, rUnit.X) * st.spin
+    -- now and then turn round: a committed U-turn (run the other way for a moment), not a dither
+    if now >= st.flipAt then
+        if st.flipAt > 0 then
+            st.spin = -st.spin
+            st.turnDir = -heading
+            st.turnUntil = now + Config.STRAFE_TURN
+        end
+        st.flipAt = now + Config.STRAFE_FLIP_MIN + math.random() * (Config.STRAFE_FLIP_MAX - Config.STRAFE_FLIP_MIN)
+    end
+    if now < (st.turnUntil or 0) and st.turnDir then heading = st.turnDir end
+    local keep = Config.STRAFE_KEEP
+    local tangent = Vector3.new(-rUnit.Z, 0, rUnit.X) * st.spin
+    local reach = Config.STRAFE_LENGTH * 2
+
+    local function score(dir, goal)
+        local sc = keep * dir:Dot(heading)                                 -- carry on the way we are running
+        sc = sc + (1 - math.abs(dir:Dot(rUnit)))                           -- circle rather than run in or out
+        sc = sc + 0.7 * dir:Dot(tangent)                                   -- ...the same way round
+        local _, d = Npcs.nearestCenter(goal, Npcs.pool)
+        sc = sc - 0.03 * math.abs(d - ring)                                -- near the ring
+        local hit = Walls.cast(me + Vector3.new(0, 1, 0), dir * reach)     -- room to keep going (no dead ends)
+        sc = sc + 0.8 * math.min(1, (hit and hit.Distance or reach) / reach)
+        return sc
+    end
+
+    local lanes = Planner.strafe({
+        from = me, speed = f.speed, windows = f.wins, length = Config.STRAFE_LENGTH, hold = Config.STRAFE_HOLD,
+        accept = accept, score = score, passable = function(pos) return Npcs.surfaceDistance(pos) >= Config.MIN_DISTANCE end,
+    })
+    for _, lane in ipairs(lanes) do
+        if Walls.moveClear(me, lane.goal) then
+            st.dir = lane.dir
+            local side = lane.dir:Dot(Vector3.new(-rUnit.Z, 0, rUnit.X))
+            if math.abs(side) > 0.4 and now >= (st.turnUntil or 0) then st.spin = side > 0 and 1 or -1 end   -- the circling follows what we actually do
+            Nav.setGoal(lane.goal)
+            ESP.setPlan({ me, lane.goal })
+            ESP.setGoal(lane.goal)
+            return
+        end
+    end
+    -- nowhere good to run: stand, and try the other way round next time
+    Nav.stop()
+    ESP.setPlan(nil)
+    ESP.setGoal(nil)
+    st.flipAt = 0
+end
+
+-- inside the cast range and nothing threatening: keep moving (see above); move purposefully when something is wrong with
+-- where we are
 function Bot.fightStep(f)
     Nav.stopPath()
     ESP.clearPath()
@@ -3947,15 +4475,19 @@ function Bot.fightStep(f)
     local needMove = f.centre > f.range * 0.95 or f.surface < Config.MIN_DISTANCE + 2 or pull > 0 or outside or tooNear
     if not needMove then
         Nav.plan = nil
-        Nav.stop()
-        ESP.setPlan(nil)
-        ESP.setGoal(nil)
+        if Bot.strafeOn() then
+            Bot.strafeStep(f)
+        else
+            Nav.stop()
+            ESP.setPlan(nil)
+            ESP.setGoal(nil)
+        end
         return
     end
 
     if f.now - Bot.lastPlan >= 0.5 or not Nav.goal then   -- (no need to re-plan a short walk ten times a second)
         Bot.lastPlan = f.now
-        local plan = Planner.plan({ from = me, speed = f.speed, windows = f.wins, penalty = f.penalty, radius = Config.PLAN_RADIUS })
+        local plan = Planner.plan({ from = me, speed = f.speed, windows = f.wins, penalty = f.penalty, radius = Config.PLAN_RADIUS, velocity = Bot.velocity() })
         local goal = Nav.follow(plan)
         local nextPoint = Nav.nextPoint(plan)
         if nextPoint and not Walls.moveClear(me, nextPoint) then
@@ -3964,7 +4496,13 @@ function Bot.fightStep(f)
         end
         ESP.setPlan(plan and plan.path)
         ESP.setGoal(goal)
-        if plan and #plan.path >= 2 then State.setMode("REPOSITION") end
+        if plan and #plan.path >= 2 then
+            State.setMode("REPOSITION")
+        elseif Bot.strafeOn() then   -- nowhere better to be: keep moving anyway
+            Bot.strafeStep(f, true)
+        end
+    elseif Bot.strafeOn() and not Nav.goal then
+        Bot.strafeStep(f, true)
     end
 end
 
@@ -4117,7 +4655,7 @@ function Bot.step()
 
     if threatened or tooClose then
         Bot.dodgeStep(f)
-    elseif Nav.aheadBlocked() then   -- an attack lies across the way we're walking: wait for it instead of walking in
+    elseif Nav.aheadBlocked() and not (Bot.strafeOn() and centre <= groupRange) then   -- an attack lies across the way we're walking: wait for it
         State.setMode("AVOID")
         Nav.stopPath()
         Nav.stop()
@@ -4125,6 +4663,7 @@ function Bot.step()
     elseif centre > groupRange then
         Bot.approachStep(f)
     else
+        f.forceReplan = Nav.aheadBlocked()   -- the lane we were on now leads into an attack: choose another at once
         Bot.fightStep(f)
     end
 
@@ -4201,7 +4740,9 @@ function Bot.dump()
     end
     local learned = {}
     for name in pairs(Hazards.learned) do table.insert(learned, name) end
-    if #learned > 0 then add("learned this run: %s", table.concat(learned, ", ")) end
+    for name in pairs(Hazards.sized) do table.insert(learned, name .. " (by size)") end
+    if #learned > 0 then add("learned attacks: %s", table.concat(learned, ", ")) end
+    add("saved attacks: %d (%s)", Hazards.savedCount(), Hazards.canPersist() and Config.LEARN_FILE or "no file access - this run only")
 
     local text = table.concat(out, "\n")
     print(text)
