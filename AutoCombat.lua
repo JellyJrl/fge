@@ -135,6 +135,11 @@ local Config = {
     HOLD_BARRAGE_FOR_RAGE   = false,
     BARRAGE_REQUIRE_LOS     = false,
     BARRAGE_RANGE           = 90,    -- starting attack range; confirmed hits raise it, misses lower it
+    -- Every npc has an `aggroRange` (a NumberValue / attribute on the npc). It only reacts - precasts, attacks - to
+    -- someone inside it, so casting from outside makes it do nothing. With this on, skills are only used (and the
+    -- bot only stands) inside min(attack range, aggroRange - AGGRO_MARGIN). Npcs without one use the attack range.
+    USE_AGGRO_RANGE         = true,
+    AGGRO_MARGIN            = 3,     -- stay this many studs inside the aggro range, so we're clearly in it
     AIM_SETTLE              = 0.1,   -- wait after lining up so the rotation reaches the server
     AIM_HOLD                = 0.3,   -- total time you stay facing them after firing
     CAST_CONFIRM_WAIT       = 0.15,  -- after firing, wait this long and check the cooldown actually started
@@ -206,6 +211,7 @@ local Config = {
     DEATH_MAX_STORED        = 200,
     KNOWN_DUNGEON_NAMES     = { "Northern Lands", "Enchanted Forest" },
     RECORDS_ROOT            = "AutoCombatRuns",
+    LEARN_VERSION           = 2,     -- bumped when saved data from older versions can't be trusted (see Learn.applyAll)
 }
 Config.IDEAL_DISTANCE = Config.MIN_DISTANCE + 4
 
@@ -381,6 +387,7 @@ function Store.update(label, mutate)
     local ok, err = pcall(function()
         local data = Store.load()
         if not mutate(data) then return end
+        data.safety.learnVersion = Config.LEARN_VERSION   -- see Learn.applyAll: untrusted data is wiped once
         local json = HttpService:JSONEncode(data)
         Store.ensureFolder()
         fs.write(Store.path(), json)
@@ -556,9 +563,49 @@ function Learn.applyAll(data)
             return changed
         end)
     end
-    for _, nm in ipairs(type(s.learnedIgnoreNames) == "table" and s.learnedIgnoreNames or {}) do
-        Learn.ignoreNames[nm] = true
+    -- "Harmless" names. Older versions of this script learned EVERY attack the bot dodged as harmless once it went
+    -- away ("precast", "hitbox", orb names ...) and saved that, which silently switched detection off. Nothing
+    -- saved without the current version stamp can be trusted, so it is wiped once; and even in a current file
+    -- a name that announces itself as an attack is never accepted.
+    local saved = type(s.learnedIgnoreNames) == "table" and s.learnedIgnoreNames or {}
+    if (s.learnVersion or 1) < Config.LEARN_VERSION then
+        if #saved > 0 then
+            Log.add(string.format("Dropped %d saved 'harmless' name(s) from an older version - they could hide real attacks", #saved))
+        end
+        if next(s) ~= nil then
+            Store.update("learned-data upgrade", function(file)
+                file.safety.learnedIgnoreNames = {}
+                return true   -- Store.update stamps the current version
+            end)
+        end
+    else
+        local dropped = 0
+        for _, nm in ipairs(saved) do
+            if Learn.looksHostileName(nm) then
+                dropped = dropped + 1
+            else
+                Learn.ignoreNames[nm] = true
+            end
+        end
+        if dropped > 0 then
+            Log.add(string.format("Dropped %d saved 'harmless' name(s) that look like attacks", dropped))
+            Store.update("harmless-name cleanup", function(file)
+                local keep = {}
+                for _, nm in ipairs(file.safety.learnedIgnoreNames or {}) do
+                    if not Learn.looksHostileName(nm) then table.insert(keep, nm) end
+                end
+                file.safety.learnedIgnoreNames = keep
+                return true
+            end)
+        end
     end
+end
+
+-- A name that announces itself as an attack (precast / hitbox / the orb name), by keyword alone.
+function Learn.looksHostileName(name)
+    local key = normalize(name)
+    return key:find("precast", 1, true) ~= nil or key:find("hitbox", 1, true) ~= nil
+        or key:find(Config.ORB_NAME_HINT, 1, true) ~= nil
 end
 
 -- A death is rare and important: persist immediately, no batching. A name that killed us is no longer "harmless".
@@ -846,7 +893,7 @@ end
 -- =====================
 -- ENEMIES: npc cache, groups, target lock
 -- =====================
-Enemies.list = {}      -- { {model, part, pos, radius, humanoid, attackDuration, key, gid} }, rebuilt by refresh()
+Enemies.list = {}      -- { {model, part, pos, radius, humanoid, attackDuration, aggroRange, key, gid} }, rebuilt by refresh()
 Enemies.groups = {}    -- { {members, centroid, radius, count} }
 Enemies.locked = nil   -- model of the npc we're locked onto
 Enemies.lastRefresh = -math.huge
@@ -892,6 +939,7 @@ function Enemies.info(model, now)
     local info = Enemies.infoCache[model]
     if info and info.part.Parent and now - info.t < 1 then
         info.attackDuration = readNumber(model, "attackSpeed")
+        info.aggroRange = readNumber(model, "aggroRange")
         return info
     end
 
@@ -908,6 +956,7 @@ function Enemies.info(model, now)
         humanoid = model:FindFirstChildOfClass("Humanoid"),
         key = normalize(model.Name),
         attackDuration = readNumber(model, "attackSpeed"),   -- how long its attack sequence lasts, when the npc says
+        aggroRange = readNumber(model, "aggroRange"),        -- how close you must be before it reacts, when the npc says
     }
     Enemies.infoCache[model] = info
     return info
@@ -931,7 +980,8 @@ function Enemies.refresh(maxAge)
                         table.insert(list, {
                             model = enemy, part = info.part, pos = info.part.Position,
                             radius = info.radius,   -- extra body size; distances are measured to the surface
-                            humanoid = info.humanoid, key = info.key, attackDuration = info.attackDuration,
+                            humanoid = info.humanoid, key = info.key,
+                            attackDuration = info.attackDuration, aggroRange = info.aggroRange,
                         })
                     end
                 end
@@ -939,6 +989,30 @@ function Enemies.refresh(maxAge)
         end
     end
     Enemies.list = list
+end
+
+-- How far from this npc (measured to its centre, like skills and aggro are) we may use skills: the learned or
+-- starting attack range, and - when the npc has an aggroRange - no further than just inside it. An npc only
+-- reacts (precasts, attacks) to someone inside its aggro range, so casting from outside it gives nothing to fight.
+-- Returns the range and whether the aggro range is what limits it.
+function Enemies.castRange(entry)
+    local range = Learn.rangeFor(entry and entry.model.Name)
+    local aggro = entry and entry.aggroRange
+    if Config.USE_AGGRO_RANGE and aggro and aggro > 0 then
+        local inside = math.max(aggro - Config.AGGRO_MARGIN, Config.MIN_DISTANCE + 2)
+        if inside < range then return inside, true end
+    end
+    return range, false
+end
+
+-- The strictest cast range of a group's members: standing inside it means every npc in the group is in reach.
+function Enemies.groupCastRange(group)
+    local range = nil
+    for _, m in ipairs(group and group.members or {}) do
+        local r = Enemies.castRange(m)
+        if not range or r < range then range = r end
+    end
+    return range or Tuned.barrageRange
 end
 
 -- Distance to the nearest npc SURFACE (centre distance minus its extra body radius).
@@ -1109,7 +1183,8 @@ Zones.COLORS = {
 }
 
 Zones.active = {}      -- [part or model] = info
-Zones.ignored = setmetatable({}, { __mode = "k" })    -- parts/models confirmed not to be attacks (our own projectiles, scenery, expired hitboxes)
+Zones.ignored = setmetatable({}, { __mode = "k" })    -- parts/models confirmed not to be attacks (our own projectiles, scenery)
+Zones.expired = setmetatable({}, { __mode = "k" })    -- parts whose attack already ended but which still exist (see Zones.expire)
 Zones.seen = setmetatable({}, { __mode = "k" })       -- [top-level part] = when the orb scan first examined it
 Zones.suspects = setmetatable({}, { __mode = "k" })   -- [object] = { name, born, pos, damaged, attack }: what might have hurt us
 Zones.hardIgnored = setmetatable({}, { __mode = "k" })   -- objects on the hard ignore list (or inside one): see isHardIgnored
@@ -1175,10 +1250,13 @@ function Zones.rawKind(obj)
 
     -- a name that hurt us before is always an attack - but never one on the hard ignore list (checked in classify)
     if Learn.attackNames[name] then return "hitbox" end
-    if Learn.isIgnoredName(name) then return nil end
+    if Learn.isHardIgnoredName(name) then return nil end
 
+    -- A name that says "precast" / "hitbox" is an attack, whatever was ever learned about it. Only then does a
+    -- learned-harmless name apply (to things the bot merely GUESSED were attacks: orbs, npc-named parts ...).
     if name:find("precast", 1, true) then return "precast" end
     if name:find("hitbox", 1, true) then return "hitbox" end
+    if Learn.ignoreNames[name] and not name:find(Config.ORB_NAME_HINT, 1, true) then return nil end
 
     if obj.Parent == workspace then
         -- A top-level part whose name contains a known npc's name ("northernmageshot" contains "northernmage")
@@ -1397,10 +1475,17 @@ function Zones.scheduleExpiry(part, info)
     end)
 end
 
--- An expired part stays ignored: it outlived its attack, and a fresh attack is a fresh part.
+-- The zone ran its course but the part is still around (it outlived its attack). The periodic scan skips it so it
+-- isn't re-flagged forever; but if the game re-adds it (a reused/pooled hitbox part), that is a NEW attack - see add().
 function Zones.expire(part)
-    Zones.ignored[part] = true
+    Zones.expired[part] = true
     Zones.remove(part)
+end
+
+-- Scenery, not an attack: never looked at again.
+function Zones.ignore(obj)
+    Zones.ignored[obj] = true
+    Zones.remove(obj)
 end
 
 -- ---- visuals ----
@@ -1536,8 +1621,12 @@ function Zones.newInfo(kind, initial, cf, size)
     }
 end
 
-function Zones.add(part, initial)
+function Zones.add(part, initial, fromEvent)
     if Zones.active[part] or Zones.ignored[part] then return end
+    if Zones.expired[part] then
+        if not fromEvent then return end   -- the polling scan must not resurrect it
+        Zones.expired[part] = nil          -- re-added by the game: a new life of a reused part
+    end
 
     local kind = Zones.classify(part)
     if not kind then return end
@@ -1712,7 +1801,7 @@ function Zones.update(now)
                 Zones.updatePrecast(info, now)
             elseif info.kind == "unknown" then
                 if now - info.born > Config.GENERIC_MAX_AGE then
-                    Zones.expire(part)   -- around far longer than any attack: scenery, never re-flag it
+                    Zones.ignore(part)   -- around far longer than any attack: scenery, never re-flag it
                 elseif info.label then
                     info.label.Text = "ATTACK?"
                     info.label.TextColor3 = Zones.COLORS.unknown
@@ -1941,9 +2030,7 @@ function Zones.markSuspectAsAttack(obj)
 end
 
 function Zones.nameLooksHostile(key)
-    return key:find("precast", 1, true) or key:find("hitbox", 1, true)
-        or key:find(Config.ORB_NAME_HINT, 1, true)
-        or Learn.attackNames[key] or Enemies.findOwnerByName(key) ~= nil
+    return Learn.looksHostileName(key) or Learn.attackNames[key] or Enemies.findOwnerByName(key) ~= nil
 end
 
 function Zones.track(obj)
@@ -2020,12 +2107,12 @@ end
 
 function Zones.onAdded(obj)
     if obj:IsA("BasePart") then
-        Zones.add(obj)
+        Zones.add(obj, nil, true)
         pcall(Zones.track, obj)
     elseif obj:IsA("Model") or obj:IsA("Folder") then
         for _, d in ipairs(obj:GetDescendants()) do
             if d:IsA("BasePart") then
-                Zones.add(d)
+                Zones.add(d, nil, true)
                 pcall(Zones.track, d)
             end
         end
@@ -2266,7 +2353,7 @@ end
 -- it, so come in until we're inside skill range (never closer than BIG_BODY_GAP to its edge).
 function Steer.ringRadiusFor(group)
     local r = group.radius + Config.IDEAL_DISTANCE
-    local stand = Tuned.barrageRange - Config.RANGE_MARGIN
+    local stand = Enemies.groupCastRange(group) - Config.RANGE_MARGIN   -- inside the aggro range too, when the npcs have one
     if r > stand then
         r = math.max(stand, group.radius + Config.BIG_BODY_GAP)
     end
@@ -2307,10 +2394,12 @@ function Steer.cheapScore(from, cand, ctx)
         score = score + exitTime * 4   -- among ways out, take the quickest (don't run through the attack)
     end
 
-    -- Loose range: stay within attack range but don't enforce a strict circle shape.
-    local looseHigh = Learn.rangeFor(ctx.nearestName) * 0.95
-    if minDist > looseHigh then
-        score = score + ((minDist - looseHigh) * 6)   -- pull in if drifted out of range
+    -- Loose range: stay inside the cast range (attack range, and the npcs' aggro range) but don't enforce a strict
+    -- circle shape. Measured to the npc's CENTRE, which is what skills and aggro both use.
+    local looseHigh = ctx.range * 0.95
+    local centerDist = Enemies.nearestCenterDist(cand)
+    if centerDist > looseHigh then
+        score = score + ((centerDist - looseHigh) * 6)   -- pull in if drifted out of range
     end
 
     local move = flat(cand - from)
@@ -2349,7 +2438,7 @@ function Steer.findBestSpot(group, urgent, inDanger)
     end
 
     local ctx = {
-        nearestName = group.members[1] and group.members[1].model and group.members[1].model.Name or nil,
+        range = Enemies.groupCastRange(group),
         startMin = Enemies.minDistance(from),
         inDanger = inDanger,
         speed = math.max(State.humanoid.WalkSpeed, 8),
@@ -3118,13 +3207,16 @@ function Skills.escapeSlack(speed)
     return deadline - Tuned.precastSafety - (exitDist / speed + Config.REACTION_TIME), exitDist
 end
 
--- The attack range to fire from right now: the npc's learned range, stretched toward a barrier we can't pass.
-function Skills.effectiveRange(nearest, barrier)
-    local range = nearest and Learn.rangeFor(nearest.model.Name) or Tuned.barrageRange
+-- The range to fire from right now, for this npc: its cast range (attack range, kept inside its aggro range), or -
+-- at a barrier we can't pass - the closest point we reached plus leeway. A barrier overrides the aggro limit:
+-- nothing nearer is possible, so holding fire would just leave the bot idle. Returns the range and whether the
+-- npc's aggro range is what limits it.
+function Skills.effectiveRange(entry, barrier)
     if barrier and barrier.hits ~= false then
-        range = math.min(math.max(range, (barrier.centerDist or barrier.dist) + Config.BARRIER_LEEWAY), range + Config.BARRIER_RANGE_CAP)
+        local range = Learn.rangeFor(entry and entry.model.Name)
+        return math.min(math.max(range, (barrier.centerDist or barrier.dist) + Config.BARRIER_LEEWAY), range + Config.BARRIER_RANGE_CAP), false
     end
-    return range
+    return Enemies.castRange(entry)
 end
 
 -- Should Inner Rage be spent on its SPEED to survive? Returns a reason string, or nil.
@@ -3146,8 +3238,8 @@ function Skills.survivalRageReason(now, inDanger, barrage, nearest)
         end
     end
 
-    local range = Skills.effectiveRange(nearest, State.stats.barrier)
-    local attackDist = Enemies.nearestCenterDist(State.hrp.Position)   -- skills reach by distance to the npc's CENTRE
+    local attackDist, reachEntry = Enemies.nearestCenterDist(State.hrp.Position)   -- skills reach by distance to the npc's CENTRE
+    local range = Skills.effectiveRange(reachEntry or nearest, State.stats.barrier)
     local attackPossible = barrage ~= nil and barrage.ready and attackDist <= range
 
     if not attackPossible then
@@ -3292,12 +3384,12 @@ function Skills.update(now, mode, nearest, nearestDist, urgent, shielded)
         Skills.info.plan = "barrage confirmed not reaching from the barrier, holding"
         return
     end
-    local range = Skills.effectiveRange(nearest, barrier)
 
     -- measured to the npc's CENTRE: a massive body makes its edge look much closer than it really is
-    local attackDist = Enemies.nearestCenterDist(State.hrp.Position)
+    local attackDist, reachEntry = Enemies.nearestCenterDist(State.hrp.Position)
+    local range, byAggro = Skills.effectiveRange(reachEntry or nearest, barrier)
     if attackDist > range then
-        Skills.info.plan = string.format("barrage ready, out of range (%.0f / %.0f)", attackDist, range)
+        Skills.info.plan = string.format("barrage ready, out of range (%.0f / %.0f%s)", attackDist, range, byAggro and ", inside its aggro range" or "")
         return
     end
 
@@ -4377,6 +4469,7 @@ function UI.build()
     marker.Parent = UI.refs.safety.track
 
     UI.refs.group = UI.row(combat, "Group")
+    UI.refs.aggro = UI.row(combat, "Aggro")
     UI.refs.barrier = UI.row(combat, "Barrier")
 
     -- ---- threats card ----
@@ -4549,6 +4642,19 @@ function UI.update()
         r.group.Text = UI.col(UI.C.dim, "--")
     end
 
+    -- the npc's aggro range and the distance we cast from (green = we are inside it)
+    if locked and stats.targetCastRange then
+        local inside = (stats.targetCenter or math.huge) <= stats.targetCastRange
+        if stats.targetAggro then
+            r.aggro.Text = UI.col(inside and UI.C.green or UI.C.orange, string.format("%.0f", stats.targetAggro))
+                .. UI.col(UI.C.dim, string.format("  cast within %.0f  %s", stats.targetCastRange, inside and "(inside)" or "(outside)"))
+        else
+            r.aggro.Text = UI.col(UI.C.dim, string.format("no aggroRange  |  cast within %.0f", stats.targetCastRange))
+        end
+    else
+        r.aggro.Text = UI.col(UI.C.dim, "--")
+    end
+
     local b = stats.barrier
     r.barrier.Text = b and UI.col(UI.C.yellow, string.format("closest %.0f (+%d)", b.dist, Config.BARRIER_LEEWAY)) or UI.col(UI.C.dim, "none")
 
@@ -4600,7 +4706,7 @@ function UI.update()
 
     local ability = Skills.attackName
     local baseRange = (ability and Learn.applied[ability]) or Tuned.barrageRange
-    local targetRange = locked and Learn.rangeFor(locked.Name) or nil
+    local targetRange = locked and stats.targetCastRange or nil   -- includes the npc's aggro limit
     if targetRange and targetRange ~= baseRange then
         r.recActive.Text = UI.col(UI.C.green, string.format("%.0f studs (vs %s)", targetRange, locked.Name))
     else
@@ -5135,6 +5241,12 @@ function Bot.step()
     stats.groupCount = #Enemies.groups
     stats.targetDist = target and (flat(pos - target.pos).Magnitude - target.radius) or nil
     stats.targetCenter = target and flat(pos - target.pos).Magnitude or nil
+    stats.targetAggro = target and target.aggroRange or nil
+    if target then
+        stats.targetCastRange, stats.targetByAggro = Skills.effectiveRange(target, barrier)
+    else
+        stats.targetCastRange, stats.targetByAggro = nil, nil
+    end
     ESP.updateRing(group)
 
     -- a precast with time left is not an emergency - only urgent once it's actually about to go off
