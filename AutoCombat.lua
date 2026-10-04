@@ -10,8 +10,13 @@
                               plus walls and the npcs' own bodies. It finds the quickest way to a spot that stays safe,
                               and re-plans ten times a second. While nothing threatens us it stays put.
                               Attacks are predicted forward, not just read as they are: a moving one by its velocity, a
-                              beam that turns (a boss's rotating beams) by its turning, and an attack that stays longer
-                              than it says is learned the first time it hurts (Hazards.windows / Hazards.heat).
+                              beam that turns (a boss's rotating beams) by its turning.
+                              An attack lasts until its part is REMOVED - destroyed, no longer drawn, or switched off -
+                              not for a stated time (that is only what is expected, for planning): an attack Model with
+                              a precast and a hitbox is over when its PRECAST is removed (the hitbox goes with it, even if
+                              its part stays), an attack of only a hitbox when that hitbox is (Hazards.state). What each
+                              kind of attack lasted is kept for the next one, and a hit that proves a sign of "over" wrong
+                              is learned for good (Hazards.misjudged, Hazards.heat).
                               In a fight the bot never stands still: it circles its target (the Move switch), so an attack
                               aimed at where it stands lands where it WAS, and every dodge starts from a run.
                               After a respawn the 5s immortality is used: attacks that end before it does are ignored, the
@@ -137,7 +142,23 @@ local Config = {
     PREDICT_MAX         = 3.0,   -- seconds ahead a MOVING attack is extrapolated (sweeping beams ...), then assumed to stop
     SPIN_MIN            = 0.08,  -- an attack turning faster than this (rad/s) is a ROTATING beam: its swept area is predicted, and it stays dangerous while it turns
     SPIN_STEP           = 0.12,  -- seconds between the samples of a rotating beam's sweep
-    LINGER_MAX          = 12,    -- an attack whose stated time is over but whose part is still there: not stood in, crossed only at a price, this long
+    -- An attack lasts until its part is REMOVED - gone from the workspace, no longer drawn, or switched off. An attack Model that
+    -- holds a precast AND a hitbox lasts as long as the precast is there (the hitbox goes with it, even if its part stays);
+    -- a hitbox with no precast lasts as long as it is there itself. The times below are only what the bot EXPECTS (for planning).
+    LIVE_RATE           = 0.1,   -- every attack's part is checked this often (seconds) for being gone / hidden / switched off
+    SHOWN_MIN           = 0.3,   -- a hitbox counts as hidden only if it had been drawn this long (a flash is not its lifetime)
+    HAND_OVER           = 0.3,   -- a precast that goes this soon after the hitbox appeared beside it was handing over, not ending the attack
+    GROUP_DIST          = 80,    -- the precast and hitbox of one attack Model lie this close at most (studs; they overlap, more or less)
+    GROUP_BIRTH         = 1.0,   -- a precast that appears within this long of a hitbox in the same Model belongs to it
+    GROUP_PARTS         = 24,    -- a Model with more parts than this is a room, not an attack
+    EXPECT_SLACK        = 0.2,   -- an attack still there this long past its expected end is "about to go" (frame jitter); only later is it known to outlast it
+    OVERRUN             = 8,     -- no sign it is still on (not drawn, no flag) and this long past its expected end: a remnant (soft)
+    OVERRUN_SHOWN       = 30,    -- ...an attack that is still drawn (or switched on) gets this long
+    OVERRUN_BODY        = 2,     -- ...a hitbox part inside an npc's body that shows no sign of being on is its weapon, not an attack: this long
+    DORMANT_MAX         = 100,   -- parts kept an eye on for being switched on again (a map full of pooled hitboxes must not cost a frame)
+    LIFE_KEEP           = 5,     -- lifetimes remembered per kind of attack (the middle one is what the next is expected to last)
+    LIFE_MAX            = 80,    -- kinds of attack whose lifetime is kept in attacks.json
+    LINGER_MAX          = 12,    -- a remnant (see OVERRUN): not stood in, crossed only at a price, this long
     LINGER_COST         = 1.5,   -- ...seconds of walking each cell of it costs when crossing
     ORB_NAME            = "battlemageorb",
     ORB_PADDING         = 3,
@@ -855,6 +876,14 @@ end
 -- Every zone has a time window [on, off] (seconds from now) in which it is dangerous, and a shape at each moment in it.
 -- ONE question is asked about all of them - "does this zone occupy this point during [t0, t1]?" - by the planner and by
 -- every check, so they can never disagree. A zone's geometry is read once per frame by update().
+--
+-- HOW LONG AN ATTACK LASTS: until its part is REMOVED - destroyed or out of the workspace, no longer drawn (it was visible and
+-- is transparent now), or switched off (an active flag, a drained lifetime, a disabled script, a hitbox that stops touching).
+--   * an attack MODEL that holds a precast and a hitbox lasts as long as its precast is there: when the precast is removed the
+--     whole attack is over, and the hitbox with it, even if the hitbox part itself stays around
+--   * an attack of only a hitbox lasts as long as that hitbox is there
+-- Times (the npc's attackSpeed, a published duration, what the same attack lasted before) are only what the bot EXPECTS, to plan
+-- with; an attack that outlasts them is simply still there (see Hazards.window).
 -- =====================
 Hazards.COLORS = {
     precast = Color3.fromRGB(255, 170, 0),
@@ -866,6 +895,16 @@ Hazards.COLORS = {
 Hazards.active = {}      -- [part or model] = zone
 Hazards.skip = setmetatable({}, { __mode = "k" })      -- objects decided NOT to be attacks (our own casts, scenery, ignore list)
 Hazards.expired = setmetatable({}, { __mode = "k" })   -- attacks that ended while their part still exists
+Hazards.dormant = setmetatable({}, { __mode = "k" })   -- [part] = { zone, why, t }: parts whose attack ended (hidden / switched off / released by the precast) but that are still there: when one is on again it is a NEW attack
+Hazards.lives = {}       -- [lifeKey] = { list = { seconds ... }, ends = { gone, hidden, off, group, soft }, n, min, max }: how long each kind of attack lasted
+Hazards.livesCount = 0
+Hazards.ended = {}       -- [lifeKey .. why] = times it was logged that this kind of attack ended that way (the log only keeps the first few)
+Hazards.endedCount = 0
+Hazards.dormantCount = 0
+Hazards.unreliable = {}  -- [lifeKey] = true: a hit proved that this kind of attack is NOT over when it is hidden / switched off / its precast goes: only its part going away ends it
+Hazards.livesDirty = false   -- there is something new about how long attacks last that attacks.json does not have yet
+Hazards.lastFlush = -math.huge
+Hazards.nextWake = 0
 Hazards.watched = setmetatable({}, { __mode = "k" })   -- objects with a Destroying handler already
 Hazards.seen = setmetatable({}, { __mode = "k" })      -- [top-level part] = when the re-check scan first looked at it
 Hazards.hidden = setmetatable({}, { __mode = "k" })    -- objects on the ignore list (or inside one): the registry the raycasts use
@@ -1038,7 +1077,7 @@ function Hazards.orbRadius(part)
     return math.max(part.Size.X, part.Size.Y, part.Size.Z) / 2 + Config.ORB_PADDING
 end
 
--- ---- how long a hitbox stays active ----
+-- ---- how long an attack is EXPECTED to last (a prediction for planning: only the part going away ends it) ----
 
 -- a lifetime published on the part or its model, if the game has one
 function Hazards.probe(part)
@@ -1054,25 +1093,27 @@ function Hazards.probe(part)
 end
 
 -- In order of reliability: the precast right before it left the sequence's timing; a lifetime on the part; the owning
--- npc's attackSpeed. zone.duration is measured from zone.born.
+-- npc's attackSpeed. zone.duration is measured from zone.born. Only a lifetime the GAME publishes (durationSrc "published")
+-- is trusted over what the same kind of attack lasted before (Hazards.lifeOf).
 function Hazards.resolve(zone, now)
     local obj = zone.obj
     local pending = Npcs.takePending(obj.Name, zone.pos, now)
     if pending then
         local remaining = pending.length - (now - pending.born)
         if remaining > 0.05 then
-            zone.duration = (now - zone.born) + remaining
+            zone.duration, zone.durationSrc = (now - zone.born) + remaining, "estimate"
             return true
         end
     end
 
-    local d = Hazards.probe(obj)
+    local published = Hazards.probe(obj)
+    local d = published
     if not d then
         local owner = Npcs.ownerOf(obj.Name, zone.pos)
         d = owner and owner.attackSpeed
     end
     if d and d > 0 then
-        zone.duration = d
+        zone.duration, zone.durationSrc = d, published and "published" or "estimate"
         return true
     end
 
@@ -1080,21 +1121,301 @@ function Hazards.resolve(zone, now)
     return false
 end
 
+local function middle(list)   -- the upper middle one: when unsure, an attack is expected to last longer
+    local copy = {}
+    for i, v in ipairs(list) do copy[i] = v end
+    table.sort(copy)
+    return copy[math.floor(#copy / 2) + 1]
+end
+
+-- How long (seconds from its birth) the zone is expected to last, or nil when nothing says. What the same kind of attack
+-- lasted before is the best guide (an attack is the same every time); the game's own number comes first when it publishes one.
+function Hazards.lifeOf(zone)
+    if zone.durationSrc == "published" and zone.duration then return zone.duration end
+    local rec = zone.lifeKey and Hazards.lives[zone.lifeKey]
+    if rec and rec.mid then return rec.mid end
+    if zone.kind == "precast" then return zone.seq and math.max(zone.seq, Config.PRECAST_DELAY + 1) or nil end
+    return zone.duration
+end
+
+-- When (on the clock) the zone is expected to be over: an attack Model lasts as long as the longest of its precasts expects.
+function Hazards.endsAt(zone)
+    local life = Hazards.lifeOf(zone)
+    local at = life and (zone.born + life) or nil
+    if zone.holders then
+        for holder in pairs(zone.holders) do
+            local h = Hazards.endsAt(holder)
+            if h and (not at or h > at) then at = h end
+        end
+    end
+    return at
+end
+
+-- remembers how long an attack of this kind lasted, and how it ended (for the report and for the next one)
+function Hazards.recordEnd(zone, why, now)
+    if (zone.kind ~= "precast" and zone.kind ~= "hitbox") or not zone.lifeKey then return end
+    local rec = Hazards.lives[zone.lifeKey]
+    if not rec then
+        if Hazards.livesCount >= Config.LIFE_MAX * 2 then   -- a game that names every attack differently must not grow this for ever
+            Hazards.lives, Hazards.livesCount = {}, 0
+        end
+        rec = { list = {}, ends = {}, n = 0, min = math.huge, max = 0, kind = zone.kind, name = zone.obj.Name }
+        Hazards.lives[zone.lifeKey] = rec
+        Hazards.livesCount = Hazards.livesCount + 1
+    end
+    rec.ends[why] = (rec.ends[why] or 0) + 1
+    local life = now - zone.born
+    if why ~= "soft" and not zone.initial and life >= 0.05 and life <= 90 then   -- (one that was there before we started has no known birth)
+        table.insert(rec.list, life)
+        while #rec.list > Config.LIFE_KEEP do table.remove(rec.list, 1) end
+        rec.n = rec.n + 1
+        rec.min, rec.max = math.min(rec.min, life), math.max(rec.max, life)
+        rec.mid = middle(rec.list)
+        if rec.n >= 2 then Hazards.livesDirty = true end
+    end
+end
+
+-- ---- is the attack still on? ----
+-- It is on while its part is THERE: in the workspace, drawn if it ever was, and not switched off. The switches are the ones a
+-- game scripts for its own hitboxes: a BoolValue / attribute named Active / Enabled / Alive ... that went false (or Done /
+-- Finished / Expired ... that went true), a lifetime NumberValue counted down to nothing, a script that disabled itself, a hitbox
+-- that stopped touching (CanTouch). Only a change counts for a lifetime or a script or CanTouch (a part that never had one is
+-- not "off"), and a part that was never drawn is not "hidden" (most hitboxes are invisible).
+local ON_FLAGS = {   -- false = off
+    active = true, isactive = true, enabled = true, isenabled = true, alive = true, isalive = true, live = true, armed = true,
+    hitboxactive = true, hitboxenabled = true, canhit = true, candamage = true,
+}
+local OFF_FLAGS = {  -- true = off
+    done = true, isdone = true, finished = true, isfinished = true, ended = true, isended = true, expired = true, isexpired = true,
+    dead = true, isdead = true, disabled = true, isdisabled = true, inactive = true, isinactive = true, destroyed = true, removed = true,
+}
+local LIFE_NUMBERS = {   -- <= 0 after having been above 0 = over
+    lifetime = true, duration = true, attackduration = true, activetime = true, hitduration = true, lifespan = true,
+    timeleft = true, timeremaining = true, remaining = true,
+}
+local flagNames, flagNameCount = {}, 0
+local function flagKey(name)
+    local k = flagNames[name]
+    if not k then
+        k = name:lower():gsub("[^%a]", "")
+        flagNameCount = flagNameCount + 1
+        if flagNameCount > 600 then flagNames, flagNameCount = {}, 1 end
+        flagNames[name] = k
+    end
+    return k
+end
+
+-- is any of it drawn? (the part, or a picture on it)
+function Hazards.shows(part)
+    local t = part.Transparency
+    if type(t) ~= "number" or t < 0.99 then return true end
+    for _, c in ipairs(part:GetChildren()) do
+        if c:IsA("Decal") or c:IsA("Texture") then
+            local ct = c.Transparency
+            if type(ct) == "number" and ct < 0.99 then return true end
+        elseif c:IsA("SurfaceGui") and c.Enabled then
+            return true   -- (a telegraph drawn as a picture on a part you can't see)
+        end
+    end
+    return false
+end
+
+-- Does something on the part, or in the Model it sits in, say that the attack is off? Returns what, or nil.
+function Hazards.switchedOff(zone, part)
+    local seen = zone.watching
+    if not seen then
+        seen = {}
+        zone.watching = seen
+    end
+    local holders = { part }
+    if zone.model then table.insert(holders, zone.model) end
+    zone.flagOn = false   -- (a switch that says it is ON is a sign of life, like being drawn: see Hazards.upkeep)
+    for _, holder in ipairs(holders) do
+        for _, c in ipairs(holder:GetChildren()) do
+            local k = flagKey(c.Name)
+            if c:IsA("BoolValue") then
+                if (ON_FLAGS[k] and c.Value == false) or (OFF_FLAGS[k] and c.Value == true) then return "flag " .. c.Name end
+                if ON_FLAGS[k] and c.Value == true then zone.flagOn = true end
+            elseif LIFE_NUMBERS[k] and (c:IsA("NumberValue") or c:IsA("IntValue")) then
+                if c.Value > 0 then seen[c] = true elseif seen[c] then return c.Name .. " ran out" end
+            elseif c:IsA("BaseScript") then
+                if not c.Disabled then seen[c] = true elseif seen[c] then return "script disabled" end
+            end
+        end
+        local ok, attrs = pcall(holder.GetAttributes, holder)
+        if ok and type(attrs) == "table" then
+            for name, v in pairs(attrs) do
+                local k = flagKey(name)
+                if type(v) == "boolean" then
+                    if (ON_FLAGS[k] and v == false) or (OFF_FLAGS[k] and v == true) then return "attribute " .. name end
+                    if ON_FLAGS[k] and v == true then zone.flagOn = true end
+                elseif type(v) == "number" and LIFE_NUMBERS[k] then
+                    if v > 0 then seen[name] = true elseif seen[name] then return "attribute " .. name .. " ran out" end
+                end
+            end
+        end
+    end
+    if zone.kind == "hitbox" and not zone.isModel then
+        local touch = part.CanTouch
+        if touch == true then zone.touchSeen = true elseif touch == false and zone.touchSeen then return "stopped touching" end
+    end
+    return nil
+end
+
+-- "live", or why the attack is over: "gone" (the part left the workspace), "hidden" (it was drawn and is not any more), "off"
+-- (a switch says so; the second result says which). Orbs and guesses (loose Models) are only ever "live" or "gone".
+function Hazards.state(zone, now)
+    local obj = zone.obj
+    if not obj.Parent or not obj:IsDescendantOf(workspace) then return "gone" end
+    if zone.isModel or (zone.kind ~= "precast" and zone.kind ~= "hitbox") or Hazards.unreliable[zone.lifeKey] then return "live" end
+
+    local drawn = Hazards.shows(obj)
+    if drawn then
+        zone.shown = true
+        zone.shownAt = zone.shownAt or now
+        zone.drawnTo = now
+    end
+    zone.drawn = drawn
+    -- a precast that is not drawn any more is over; a hitbox too, unless it was only a flash
+    if zone.shown and not drawn and (zone.kind == "precast" or zone.drawnTo - zone.shownAt >= Config.SHOWN_MIN) then
+        zone.why = "no longer drawn"
+        return "hidden"
+    end
+    if now >= (zone.nextFlags or 0) then   -- (the switches are looked at less often: they need a walk over the children)
+        zone.nextFlags = now + 0.3
+        zone.offWhy = Hazards.switchedOff(zone, obj)
+    end
+    if zone.offWhy then
+        zone.why = zone.offWhy
+        return "off"
+    end
+    return "live"
+end
+
+-- ---- attack Models: a precast and a hitbox that belong together ----
+
+-- the Model an attack's parts sit in, when it is a Model of the attack's own (not a body, and not a room full of other parts)
+function Hazards.attackModel(part)
+    local cur = part.Parent
+    while cur and cur ~= workspace do
+        if cur:IsA("Model") then
+            if cur:FindFirstChildOfClass("Humanoid") or #cur:GetChildren() > Config.GROUP_PARTS then return nil end
+            return cur
+        end
+        cur = cur.Parent
+    end
+    return nil
+end
+
+-- do two parts of one Model lie where one attack would put them? (a precast and the hitbox it announces overlap, more or less;
+-- a Model that serves several attacks at once has them apart)
+function Hazards.together(a, b)
+    local reach = (math.max(a.size.X, a.size.Z) + math.max(b.size.X, b.size.Z)) / 2 + 6
+    return flat(a.pos - b.pos).Magnitude <= math.min(reach, Config.GROUP_DIST)
+end
+
+function Hazards.unpark(obj)
+    if Hazards.dormant[obj] then
+        Hazards.dormant[obj] = nil
+        Hazards.dormantCount = math.max(0, Hazards.dormantCount - 1)
+    end
+end
+
+function Hazards.hold(precast, hitbox)
+    hitbox.holders = hitbox.holders or {}
+    hitbox.holders[precast] = true
+    precast.holds = precast.holds or {}
+    precast.holds[hitbox] = true
+end
+
+-- A hitbox that appears while a precast of its own Model is up (or a precast that appears with a hitbox in its Model) is part of
+-- ONE attack, and the precast's removal ends it. A hitbox whose precast is already gone is an attack of its own.
+function Hazards.link(zone)
+    local model = zone.model
+    if not model or zone.isModel then return end
+    for _, other in pairs(Hazards.active) do
+        if other ~= zone and other.model == model and Hazards.together(zone, other) then
+            if zone.kind == "hitbox" and other.kind == "precast" then
+                Hazards.hold(other, zone)
+            elseif zone.kind == "precast" and other.kind == "hitbox" and math.abs(other.born - zone.born) <= Config.GROUP_BIRTH then
+                Hazards.hold(zone, other)
+            end
+        end
+    end
+    if zone.kind == "precast" then   -- a hitbox the last precast of this Model let go of is part of the next attack the Model makes
+        local wake = {}
+        for _, d in pairs(Hazards.dormant) do
+            if d.why == "group" and d.zone.model == model then table.insert(wake, d) end
+        end
+        for _, d in ipairs(wake) do Hazards.revive(d) end
+    end
+end
+
+-- does the end of this precast end an attack? (it holds a hitbox that has been up for a while, not one that just appeared)
+function Hazards.endsAttack(zone, now)
+    for hit in pairs(zone.holds or {}) do
+        if now - hit.born >= Config.HAND_OVER then return true end
+    end
+    return false
+end
+
+-- A precast has gone (mode "end"), been given up on (mode "soft") or merely stopped being tracked (mode "free"). The hitboxes it
+-- held are over with it, unless the hitbox appeared as the precast went (the sequence's next step: it carries on as an attack
+-- of its own, with the timing the precast leaves behind).
+function Hazards.release(zone, now, mode)
+    local held = zone.holds
+    if not held then return end
+    zone.holds = nil
+    for hit in pairs(held) do
+        local holders = hit.holders
+        if holders then
+            holders[zone] = nil
+            if next(holders) == nil then
+                hit.holders = nil
+                if Hazards.active[hit.obj] == hit then
+                    if mode == "soft" then
+                        Hazards.soften(hit)
+                    elseif mode == "free" or Hazards.unreliable[hit.lifeKey] then
+                        -- stays an attack of its own
+                    elseif now - hit.born >= Config.HAND_OVER then
+                        Hazards.finish(hit, "group")
+                    else
+                        hit.duration, hit.durationSrc, hit.gaveUp = nil, nil, false
+                        Hazards.resolve(hit, now)
+                    end
+                end
+            end
+        end
+    end
+end
+
 -- ---- creating / removing zones ----
 
 function Hazards.newZone(obj, kind, initial, cf, size, isModel)
     local now = clock()
+    local key = Hazards.bareName(normalize(obj.Name))   -- what its kind of attack is called (for what is learned about it)
     return {
-        obj = obj, kind = kind, isModel = isModel,
+        obj = obj, kind = kind, isModel = isModel, initial = initial,
         -- a zone that already existed when we loaded is probably part-way through its sequence
         born = initial and (now - Config.PRECAST_DELAY * 0.6) or now,
         cf = cf, size = size, pos = cf.Position,
         vel = Vector3.zero, flatVel = Vector3.zero, moving = false,
         lastPos = cf.Position, lastT = now,
-        key = Hazards.bareName(normalize(obj.Name)),   -- what its kind of attack is called (for what is learned about it)
+        key = key, lifeKey = kind .. ":" .. key,
         spin = 0, rotating = false, yawU = nil, yawHist = {}, px = 0, pz = 0,   -- turning: rad/s, and the point it turns about
         radius = 0,
     }
+end
+
+-- keep an eye on a part whose attack is over (for the day it is on again), unless there are too many of them already
+function Hazards.park(zone, why)
+    local obj = zone.obj
+    Hazards.expired[obj] = true
+    if not Hazards.dormant[obj] then
+        if Hazards.dormantCount >= Config.DORMANT_MAX then return end
+        Hazards.dormantCount = Hazards.dormantCount + 1
+    end
+    Hazards.dormant[obj] = { zone = zone, why = why, t = clock(), nextLook = clock() + Config.LIVE_RATE }
 end
 
 -- the one Destroying handler an object ever gets (a reused part can be added many times)
@@ -1102,15 +1423,8 @@ function Hazards.watch(obj)
     if Hazards.watched[obj] then return end
     Hazards.watched[obj] = true
     obj.Destroying:Connect(function()
-        local zone = Hazards.active[obj]
-        if zone and zone.kind == "precast" then
-            -- Leave the sequence's start + length with the owning npc, so the hitbox that follows (even with an
-            -- unrelated name) can work out how long it has left.
-            local owner = Npcs.ownerOf(obj.Name, zone.pos)
-            local length = zone.seq or (owner and owner.attackSpeed)
-            if owner and length and length > 0 then Npcs.setPending(owner.model, zone.born, length) end
-        end
-        Hazards.remove(obj)
+        Hazards.unpark(obj)
+        Hazards.remove(obj, "gone")
     end)
 end
 
@@ -1145,6 +1459,7 @@ function Hazards.add(obj, initial, fromEvent)
     if Hazards.expired[obj] then
         if not fromEvent then return end   -- the polling scan must not resurrect it
         Hazards.expired[obj] = nil         -- the game re-added it: a new life of a reused part
+        Hazards.unpark(obj)
     end
 
     local kind = Hazards.classify(obj, initial)
@@ -1152,6 +1467,8 @@ function Hazards.add(obj, initial, fromEvent)
 
     local zone = Hazards.newZone(obj, kind, initial, obj.CFrame, obj.Size, false)
     zone.body = Hazards.inBody(obj)
+    zone.model = Hazards.attackModel(obj)   -- (an attack Model inside an npc's body is one too; parts directly in the body are not)
+    if zone.model then zone.lifeKey = kind .. ":" .. Hazards.bareName(normalize(zone.model.Name)) .. "/" .. zone.key end
     Hazards.adoptSpin(zone)
     if kind == "orb" then zone.radius = Hazards.orbRadius(obj) end
     if kind == "precast" then   -- the npc's attackSpeed is the whole sequence's length
@@ -1159,11 +1476,20 @@ function Hazards.add(obj, initial, fromEvent)
         zone.seq = owner and owner.attackSpeed or nil
     end
 
+    -- A part that is switched off right now is not an attack yet: it waits (Hazards.wake) until it is on.
+    local state = Hazards.state(zone, clock())
+    if state == "gone" then return end
+    Hazards.watch(obj)
+    if state ~= "live" then
+        Hazards.park(zone, state)   -- (the polling scan leaves it; the wake loop is the one to watch it)
+        return
+    end
+
     Hazards.active[obj] = zone
     State.ignoreDirty = true
     ESP.attach(zone)
     Log.add(kind .. ": " .. obj.Name)
-    Hazards.watch(obj)
+    Hazards.link(zone)
 
     if kind == "hitbox" then Hazards.resolve(zone, clock()) end
 end
@@ -1179,6 +1505,9 @@ function Hazards.addModel(model, initial)
         return
     end
     if Hazards.inCharacter(model) or model:FindFirstChildOfClass("Humanoid") then return end   -- bodies aren't attacks
+    for _, d in ipairs(model:GetDescendants()) do   -- an attack Model whose own parts are attacks is represented by them (and lasts as they do)
+        if Hazards.active[d] or Hazards.dormant[d] then return end
+    end
 
     local ok, cf, size = pcall(function() return model:GetBoundingBox() end)
     if not ok or not cf then return end
@@ -1196,45 +1525,96 @@ function Hazards.addModel(model, initial)
     Hazards.watch(model)
 end
 
-function Hazards.remove(obj)
+-- `why` = how it ended ("gone", "hidden", "off", "group", "soft": counted and timed for the report and for the next attack of that
+-- kind); nil = simply not tracked any more (scenery, shutting down). `soft` = a remnant: what it holds is given up on with it.
+function Hazards.remove(obj, why, soft)
     Hazards.lingering[obj] = nil
     local zone = Hazards.active[obj]
     if not zone then return end
+    local now = clock()
     if zone.rotating then   -- the game usually replaces the precast by a hitbox at the same pose: that one is turning too
-        table.insert(Hazards.spinMemory, { t = clock(), spin = zone.spin, px = zone.px, pz = zone.pz, cf = zone.cf, size = zone.size })
+        table.insert(Hazards.spinMemory, { t = now, spin = zone.spin, px = zone.px, pz = zone.pz, cf = zone.cf, size = zone.size })
         while #Hazards.spinMemory > 8 do table.remove(Hazards.spinMemory, 1) end
     end
     Hazards.active[obj] = nil
     State.ignoreDirty = true
     ESP.detach(zone)
+    if why then Hazards.recordEnd(zone, why, now) end
+    if zone.kind == "precast" and (why == "gone" or why == "hidden" or why == "off") and not Hazards.endsAttack(zone, now) then
+        -- the sequence's next step is a hitbox: leave the sequence's start + length with the owning npc, so the hitbox that
+        -- follows (even with an unrelated name) can work out how long it has left
+        local owner = Npcs.ownerOf(obj.Name, zone.pos)
+        local length = zone.seq or (owner and owner.attackSpeed)
+        if owner and length and length > 0 then Npcs.setPending(owner.model, zone.born, length) end
+    end
+    Hazards.release(zone, now, (why == nil) and "free" or (soft and "soft" or "end"))
 end
 
--- The attack ran its course but the part still exists. The polling scan won't re-flag it; if the game re-adds it
--- (a pooled hitbox part), that is a NEW attack. Parts of the same multi-part attack (appeared together under the
--- same model) go with it.
-function Hazards.expire(obj)
-    local zone = Hazards.active[obj]
+-- The attack is over by its part's own account: it went, was hidden, was switched off - or the precast that held it went.
+-- Unless it was destroyed the part is still there: it waits, watched, for the day it is on again (a pooled part), and is then a
+-- NEW attack. (The polling scan must not take it for one in the meantime: it is marked expired.)
+function Hazards.finish(zone, why)
+    local obj = zone.obj
     Hazards.expired[obj] = true
-    Hazards.remove(obj)
-    if zone and obj.Parent and Config.LINGER_MAX > 0 then   -- over by its own account, but still there: see Hazards.windows
+    Hazards.remove(obj, why)
+    local enough = Hazards.ended[zone.lifeKey .. why] or 0   -- (what ended it is logged for the first few of each kind: the evidence)
+    if why ~= "gone" and (zone.kind == "precast" or zone.kind == "hitbox") and enough < 2 then
+        if enough == 0 then
+            Hazards.endedCount = Hazards.endedCount + 1
+            if Hazards.endedCount > 400 then Hazards.ended, Hazards.endedCount = {}, 1 end
+        end
+        Hazards.ended[zone.lifeKey .. why] = enough + 1
+        Log.add(string.format("%s %s over: %s", zone.kind, obj.Name, why == "group" and "its precast is gone" or (zone.why or why)))
+    end
+    if why ~= "gone" and obj.Parent then Hazards.park(zone, why) end
+end
+
+-- A remnant: still there well past its expected end with nothing to say it is on. It may be an attack that simply lasts longer
+-- than anyone expected, so it is a SOFT zone for LINGER_MAX seconds (see Hazards.windows): not stood in, crossed only at a price.
+-- Being hit inside one makes it (and every attack of its name) hard for good (Hazards.heat).
+function Hazards.soften(zone)
+    local obj = zone.obj
+    Hazards.expired[obj] = true
+    Hazards.remove(obj, "soft", true)
+    if obj.Parent and Config.LINGER_MAX > 0 then
         zone.endedAt = clock()
         Hazards.lingering[obj] = zone
     end
-    local model = zone and obj.Parent
-    if model and model ~= workspace and model:IsA("Model") then
-        for _, d in ipairs(model:GetDescendants()) do
-            local other = d:IsA("BasePart") and Hazards.active[d]
-            if other and math.abs(other.born - zone.born) <= 1 then
-                Hazards.expired[d] = true
-                Hazards.remove(d)
+end
+
+-- a part that was switched off / hidden / let go of is on again: a new attack
+function Hazards.revive(d)
+    local obj = d.zone.obj
+    Hazards.unpark(obj)
+    Hazards.expired[obj] = nil
+    Hazards.add(obj, nil, true)
+end
+
+-- the parts waiting to be on again (looked at LIVE_RATE apart; the ones a precast let go of wait for the Model's next precast)
+function Hazards.wake(now)
+    if now < Hazards.nextWake then return end
+    Hazards.nextWake = now + Config.LIVE_RATE
+    local ready = {}
+    for obj, d in pairs(Hazards.dormant) do
+        if now >= d.nextLook then
+            d.nextLook = now + ((now - d.t < 5) and Config.LIVE_RATE or 0.5)   -- (one that has been off a while is looked at less often)
+            if not obj.Parent or not obj:IsDescendantOf(workspace) then
+                Hazards.unpark(obj)
+            elseif d.why ~= "group" and Hazards.state(d.zone, now) == "live" then
+                table.insert(ready, d)
             end
         end
     end
+    for _, d in ipairs(ready) do Hazards.revive(d) end
+    local n = 0   -- (the table is weak: parts that were collected left it silently)
+    for _ in pairs(Hazards.dormant) do n = n + 1 end
+    Hazards.dormantCount = n
 end
 
 -- scenery: never looked at again
 function Hazards.dismiss(obj)
     Hazards.skip[obj] = true
+    Hazards.unpark(obj)
     Hazards.remove(obj)
 end
 
@@ -1294,6 +1674,11 @@ end
 
 function Hazards.update(now)
     Hazards.trackRecent(now)
+    Hazards.wake(now)
+    if Hazards.livesDirty and now - Hazards.lastFlush > 30 then   -- what was learned about how long attacks last is kept for the next run
+        Hazards.livesDirty, Hazards.lastFlush = false, now
+        pcall(Hazards.writeSaved)
+    end
     for obj, zone in pairs(Hazards.lingering) do
         if not obj.Parent or now - (zone.endedAt or now) > Config.LINGER_MAX then
             Hazards.lingering[obj] = nil
@@ -1303,45 +1688,69 @@ function Hazards.update(now)
     end
     for obj, zone in pairs(Hazards.active) do
         if not obj.Parent then
-            Hazards.remove(obj)
+            Hazards.remove(obj, "gone")
         else
-            Hazards.refreshGeometry(obj, zone)
-
-            -- velocity of EVERY attack: moving hitboxes / sweeping beams are extrapolated, not just orbs
-            local dt = now - zone.lastT
-            if dt > 0 then
-                local inst = (zone.pos - zone.lastPos) / dt
-                if inst.Magnitude > 300 then   -- a part made at the origin and put in place a moment later, or moved in one jump: not a speed
-                    zone.vel = Vector3.zero
-                    zone.yawHist, zone.lastYaw = {}, nil
-                else
-                    zone.vel = zone.vel:Lerp(inst, 0.5)
-                end
-                zone.lastPos = zone.pos
-                zone.lastT = now
+            -- Still on? (gone / hidden / switched off ends it - and what it holds, if it is a precast.) Nothing else does.
+            local state = "live"
+            if now >= (zone.nextLive or 0) then
+                zone.nextLive = now + Config.LIVE_RATE
+                state = Hazards.state(zone, now)
             end
-            zone.moving = flat(zone.vel).Magnitude > 0.7
-            if not zone.rotating and #Hazards.spinMemory > 0 and now - zone.born < 0.5 then Hazards.adoptSpin(zone) end   -- (positioned just after it appeared?)
-            Hazards.trackSpin(zone, now)
-
-            local age = now - zone.born
-            if zone.kind == "orb" then
-                local v = zone.vel
-                local av = obj.AssemblyLinearVelocity
-                if av.Magnitude > v.Magnitude then v = av end
-                zone.flatVel = flat(v)
-            elseif zone.kind == "hitbox" then
-                if not zone.duration and not zone.gaveUp and now >= (zone.nextResolve or 0) then
-                    zone.nextResolve = now + 0.1
-                    Hazards.resolve(zone, now)
-                end
-                if zone.duration and not zone.rotating and not zone.hot and not Hazards.persistent[zone.key] and age >= zone.duration + Config.PRECAST_SAFETY + 0.05 then   -- (its window already counts the safety margin)
-                    Hazards.expire(obj)
-                end
-            elseif zone.kind == "unknown" and not zone.rotating and age > Config.UNKNOWN_MAX_AGE then
-                Hazards.dismiss(obj)   -- around far longer than any attack: scenery
+            if state ~= "live" then
+                Hazards.finish(zone, state)
+            else
+                Hazards.upkeep(obj, zone, now)
             end
         end
+    end
+end
+
+-- one live attack's frame: where it is, how fast it moves, whether it turns, what is expected of it
+function Hazards.upkeep(obj, zone, now)
+    Hazards.refreshGeometry(obj, zone)
+
+    -- velocity of EVERY attack: moving hitboxes / sweeping beams are extrapolated, not just orbs
+    local dt = now - zone.lastT
+    if dt > 0 then
+        local inst = (zone.pos - zone.lastPos) / dt
+        if inst.Magnitude > 300 then   -- a part made at the origin and put in place a moment later, or moved in one jump: not a speed
+            zone.vel = Vector3.zero
+            zone.yawHist, zone.lastYaw = {}, nil
+            if zone.kind == "precast" and now - zone.born > 0.5 and flat(zone.pos - zone.lastPos).Magnitude > 12 then
+                zone.born = now   -- a telegraph that jumps somewhere else is a new one (a pooled part, used again)
+            end
+        else
+            zone.vel = zone.vel:Lerp(inst, 0.5)
+        end
+        zone.lastPos = zone.pos
+        zone.lastT = now
+    end
+    zone.moving = flat(zone.vel).Magnitude > 0.7
+    if not zone.rotating and #Hazards.spinMemory > 0 and now - zone.born < 0.5 then Hazards.adoptSpin(zone) end   -- (positioned just after it appeared?)
+    Hazards.trackSpin(zone, now)
+
+    local age = now - zone.born
+    if zone.kind == "orb" then
+        local v = zone.vel
+        local av = obj.AssemblyLinearVelocity
+        if av.Magnitude > v.Magnitude then v = av end
+        zone.flatVel = flat(v)
+    elseif zone.kind == "hitbox" or zone.kind == "precast" then
+        if zone.kind == "hitbox" and not zone.duration and not zone.gaveUp and now >= (zone.nextResolve or 0) then
+            zone.nextResolve = now + 0.1
+            Hazards.resolve(zone, now)
+        end
+        -- Long past when it should have been over, and nothing says it is on (not drawn, no switch on): a remnant. (An attack that
+        -- is still drawn, or switched on, or known to outlast its time, is left alone: only its part going away ends it.)
+        if not zone.rotating and not zone.hot and not Hazards.persistent[zone.key] and not Hazards.unreliable[zone.lifeKey] then
+            local at = Hazards.endsAt(zone)
+            if at then
+                local alive = zone.flagOn or (zone.drawn and not zone.body)   -- (an npc's weapon is always drawn: that says nothing)
+                if now > at + (alive and Config.OVERRUN_SHOWN or (zone.body and Config.OVERRUN_BODY or Config.OVERRUN)) then Hazards.soften(zone) end
+            end
+        end
+    elseif zone.kind == "unknown" and not zone.rotating and age > Config.UNKNOWN_MAX_AGE then
+        Hazards.dismiss(obj)   -- around far longer than any attack: scenery
     end
 end
 
@@ -1713,8 +2122,20 @@ function Hazards.writeSaved()
     for key in pairs(Hazards.persistent) do table.insert(persistent, key) end
     table.sort(persistent)
     while #persistent > 60 do table.remove(persistent) end
+    local unreliable = {}   -- the attacks that a hit proved are not over when they are hidden / switched off / their precast goes
+    for key in pairs(Hazards.unreliable) do table.insert(unreliable, key) end
+    table.sort(unreliable)
+    while #unreliable > 60 do table.remove(unreliable) end
+    local lives = {}   -- how long each kind of attack lasted (the middle one of the last few), so the next run expects it from the first
+    local count = 0
+    for key, rec in pairs(Hazards.lives) do
+        if rec.mid and (rec.n >= 2 or rec.loaded) and count < Config.LIFE_MAX then
+            lives[key] = math.floor(rec.mid * 20 + 0.5) / 20
+            count = count + 1
+        end
+    end
     local ok, err = pcall(function()
-        local text = HttpService:JSONEncode({ version = Config.LEARN_VERSION, attacks = list, persistent = persistent })
+        local text = HttpService:JSONEncode({ version = Config.LEARN_VERSION, attacks = list, persistent = persistent, lives = lives, unreliable = unreliable })
         if type(isfolder) == "function" and type(makefolder) == "function" then
             local folder = Config.LEARN_FILE:match("^(.*)/[^/]*$")
             if folder and not isfolder(folder) then makefolder(folder) end
@@ -1791,6 +2212,29 @@ function Hazards.loadSaved()
         end
     end
     if n > 0 then Log.add(string.format("Loaded %d saved attack(s) from earlier deaths", n)) end
+    if type(data.unreliable) == "table" then
+        local u = 0
+        for _, key in ipairs(data.unreliable) do
+            if u >= 60 then break end
+            if type(key) == "string" and #key <= 90 and key:match("^%a+:[%w/]+$") then
+                Hazards.unreliable[key] = true
+                u = u + 1
+            end
+        end
+        if u > 0 then Log.add(string.format("Loaded %d attack(s) that are only over when their part is gone", u)) end
+    end
+    if type(data.lives) == "table" then
+        local l = 0
+        for key, seconds in pairs(data.lives) do
+            if l >= Config.LIFE_MAX then break end
+            if type(key) == "string" and #key <= 90 and type(seconds) == "number" and seconds > 0.05 and seconds <= 90 and not Hazards.lives[key] then
+                Hazards.lives[key] = { list = { seconds }, ends = {}, n = 0, min = seconds, max = seconds, mid = seconds, loaded = true }
+                Hazards.livesCount = Hazards.livesCount + 1
+                l = l + 1
+            end
+        end
+        if l > 0 then Log.add(string.format("Loaded how long %d kind(s) of attack lasted", l)) end
+    end
     if type(data.persistent) == "table" then
         local p = 0
         for _, key in ipairs(data.persistent) do
@@ -1822,6 +2266,7 @@ end
 -- throw away everything learned (this run's and the saved file)
 function Hazards.forgetAll()
     Hazards.learned, Hazards.sized, Hazards.saved, Hazards.suspects, Hazards.persistent = {}, {}, {}, {}, {}
+    Hazards.lives, Hazards.livesCount, Hazards.ended, Hazards.unreliable = {}, 0, {}, {}
     Hazards.runLearned, Hazards.pendingDeath = 0, nil
     Hazards.skip = setmetatable({}, { __mode = "k" })
     pcall(function()
@@ -1842,28 +2287,27 @@ function Hazards.timeToFire(zone, now)
     return 0
 end
 
--- The time window [on, off] (seconds from now) in which the zone is dangerous. A precast is dangerous from just before
--- it fires (PRECAST_SAFETY) for as long as it lasts (the hitbox that replaces it covers the same ground).
+-- The time window [on, off] (seconds from now) in which the zone is dangerous. A precast is dangerous from just before it fires
+-- (PRECAST_SAFETY) for as long as it lasts (the hitbox that replaces it covers the same ground). `off` is only an EXPECTATION -
+-- the part is still there, so the attack is still on - and it is made again at every look: an attack that has outlasted what
+-- was expected of it is assumed to last another HITBOX_ASSUME seconds, then again (so a plan never counts on it being over).
 function Hazards.window(zone, now)
     local age = now - zone.born
-    if (zone.hot or Hazards.persistent[zone.key]) and zone.kind ~= "orb" then   -- known to outlast its stated time: dangerous while the part is there
-        return (zone.kind == "precast") and math.max(0, Config.PRECAST_DELAY - age - Config.PRECAST_SAFETY) or 0, math.huge
+    if zone.kind == "orb" then return 0, Config.ORB_HORIZON end
+    if zone.kind == "unknown" then
+        if zone.hot or Hazards.persistent[zone.key] then return 0, math.huge end
+        return 0, math.max(0, Config.UNKNOWN_MAX_AGE - age)
     end
-    if zone.kind == "precast" then
-        -- dangerous from just before it fires, until its sequence (precast + hitbox) is over - when the npc says how long that is
-        local off = zone.seq and (math.max(zone.seq, Config.PRECAST_DELAY + 1) - age + Config.PRECAST_SAFETY) or math.huge
-        if zone.rotating then off = math.huge end   -- (a beam that is still turning is still there)
-        return math.max(0, Config.PRECAST_DELAY - age - Config.PRECAST_SAFETY), off
-    elseif zone.kind == "hitbox" then
-        if zone.rotating then return 0, math.huge end
-        if zone.duration then
-            return 0, math.max(0, zone.duration - age) + Config.PRECAST_SAFETY
-        end
-        return 0, Config.HITBOX_ASSUME
-    elseif zone.kind == "orb" then
-        return 0, Config.ORB_HORIZON
-    end
-    return 0, math.max(0, Config.UNKNOWN_MAX_AGE - age)
+    local on = zone.kind == "precast" and math.max(0, Config.PRECAST_DELAY - age - Config.PRECAST_SAFETY) or 0
+    -- turning, or known to outlast its stated time: dangerous for as long as the part is there
+    if zone.rotating or zone.hot or Hazards.persistent[zone.key] then return on, math.huge end
+
+    local at = Hazards.endsAt(zone)
+    if not at then return on, (zone.kind == "precast") and math.huge or Config.HITBOX_ASSUME end
+    local left = at - now
+    if left <= -Config.EXPECT_SLACK then left = Config.HITBOX_ASSUME elseif left < 0 then left = 0 end
+    if zone.kind == "precast" then left = math.max(left, on + Config.HITBOX_ASSUME) end   -- (it fires at `on`: there has to be a window)
+    return on, left + Config.PRECAST_SAFETY
 end
 
 -- every zone with its window, for a batch of questions at one moment (the planner asks thousands)
@@ -1872,10 +2316,10 @@ end
 -- see the harmless part, and the bot is clear of the zones the instant the shield runs out.
 Hazards.shieldLeft = 0
 
--- An attack that is over by its own account (its precast ran past the npc's attackSpeed, a hitbox past its duration) while its
--- part is still there is probably a remnant - but may be an attack that simply lasts longer than it says. So it is a SOFT
--- zone for LINGER_MAX seconds: not a place to stop or end a run in, crossed only at a price, never a reason to dodge from afar.
--- Being hit inside one makes it (and every attack of its name) hard for good: see Hazards.heat.
+-- A remnant (still there long past its expected end with nothing to say it is on - see Hazards.soften) is a SOFT zone for
+-- LINGER_MAX seconds: not a place to stop or end a run in, crossed only at a price, never a reason to dodge from afar. So is an
+-- attack that will be over before the shield ends, but that has not been seen to go.
+-- Being hit inside a soft zone makes it (and every attack of its name) hard for good: see Hazards.heat.
 function Hazards.windows(now)
     local list = {}
     local shield = Hazards.shieldLeft
@@ -1885,8 +2329,7 @@ function Hazards.windows(now)
         if off > shield then
             table.insert(list, { zone = zone, on = math.max(on, shield), off = off })
         elseif linger and zone.kind ~= "orb" then
-            zone.endedAt = zone.endedAt or now
-            if now - zone.endedAt < Config.LINGER_MAX then table.insert(list, { zone = zone, on = shield, off = math.huge, soft = true }) end
+            table.insert(list, { zone = zone, on = shield, off = math.huge, soft = true })
         end
     end
     if linger then
@@ -1921,6 +2364,37 @@ function Hazards.heat(pos, wins)
             end
         end
     end
+    return named
+end
+
+-- We were hit at `pos`, and no live attack explains it. If that was inside the part of an attack we had just ENDED because it was
+-- hidden, switched off, or its precast had gone, that sign did not mean "over" for this kind of attack: from now on (this run, and
+-- later ones: it is saved) only its part going away ends it. The attack is back at once. Returns the kinds.
+function Hazards.misjudged(pos)
+    local now = clock()
+    local wake = {}
+    for obj, d in pairs(Hazards.dormant) do
+        local zone = d.zone
+        if (zone.kind == "precast" or zone.kind == "hitbox") and obj.Parent and now - d.t <= 6 and not Hazards.unreliable[zone.lifeKey] then
+            local l = obj.CFrame:PointToObjectSpace(pos)
+            local half = obj.Size / 2
+            if math.abs(l.X) <= half.X + 1.5 and math.abs(l.Z) <= half.Z + 1.5 and math.abs(l.Y) <= half.Y + 1.5 + Config.VERTICAL then
+                table.insert(wake, d)
+            end
+        end
+    end
+    local named = {}
+    for _, d in ipairs(wake) do
+        local zone = d.zone
+        if not Hazards.unreliable[zone.lifeKey] then
+            Hazards.unreliable[zone.lifeKey] = true
+            table.insert(named, zone.lifeKey)
+            Log.add(string.format("Learned: %s stays dangerous while its part is there (it was ended: %s)", zone.obj.Name,
+                d.why == "group" and "its precast had gone" or (zone.why or d.why)))
+        end
+        Hazards.revive(d)
+    end
+    if #named > 0 then pcall(Hazards.writeSaved) end
     return named
 end
 
@@ -3891,11 +4365,13 @@ function ESP.updateZone(zone, now)
         v.label.Text = left > 0 and string.format("PRECAST  %.1fs", left) or "FIRING"
         v.label.TextColor3 = c
     elseif zone.kind == "hitbox" then
-        if zone.duration then
-            local left = math.max(0, zone.duration - (now - zone.born))
-            v.label.Text = left > 0 and string.format("HITBOX  %.1fs", left) or "HITBOX (ending)"
+        -- it lasts until it (or, in an attack Model, its precast) is gone: the time is only what is expected
+        local at = Hazards.endsAt(zone)
+        local left = at and (at - now) or nil
+        if left and left > 0 then
+            v.label.Text = string.format(zone.holders and "HITBOX  ~%.1fs (with its precast)" or "HITBOX  ~%.1fs", left)
         else
-            v.label.Text = "HITBOX"
+            v.label.Text = zone.holders and "HITBOX (while its precast is up)" or (at and "HITBOX (still there)" or "HITBOX")
         end
         v.label.TextColor3 = Hazards.COLORS.hitbox
     elseif zone.kind == "orb" then
@@ -4806,6 +5282,11 @@ function Bot.onDamage(amount, pos)
         Hazards.pendingDeath = nil
         return
     end
+    -- the part of an attack we had just taken for over (hidden / switched off / its precast gone) was touching us: it was not over
+    if #Hazards.misjudged(pos) > 0 then
+        Hazards.pendingDeath = nil
+        return
+    end
     local suspects = Hazards.blame(pos, amount >= State.hum.MaxHealth * Config.HEAVY_HIT)
     local now = clock()
     if now - Bot.lastUnseen > 1 then
@@ -5515,7 +5996,32 @@ function Bot.reportText()
     for _ in pairs(Hazards.lingering) do lingering = lingering + 1 end
     for key in pairs(Hazards.persistent) do table.insert(persistent, key) end
     table.sort(persistent)
-    add("over by their own account but still there: %d%s", lingering, #persistent > 0 and ("; known to outlast their time: " .. table.concat(persistent, ", ")) or "")
+    add("remnants (long past their expected end, nothing to say they are on): %d%s", lingering, #persistent > 0 and ("; known to outlast their time: " .. table.concat(persistent, ", ")) or "")
+    local reliable = {}
+    for key in pairs(Hazards.unreliable) do table.insert(reliable, key) end
+    table.sort(reliable)
+    if #reliable > 0 then add("attacks a hit proved are only over when their part is gone (hidden / switched off / precast gone do not end them): %s", table.concat(reliable, ", ")) end
+    -- how each kind of attack ended and how long it lasted: the evidence for "an attack lasts until its part is removed"
+    local ended = {}
+    for key, rec in pairs(Hazards.lives) do
+        local total = 0
+        for _, n in pairs(rec.ends) do total = total + n end
+        if total > 0 then table.insert(ended, { key = key, rec = rec, total = total }) end
+    end
+    table.sort(ended, function(a, b)
+        if a.total ~= b.total then return a.total > b.total end
+        return a.key < b.key
+    end)
+    add("--- how attacks ended (an attack lasts until its part is removed - gone, no longer drawn, switched off; an attack Model until its precast is) ---")
+    for i = 1, math.min(#ended, 30) do
+        local e = ended[i]
+        local how = {}
+        for _, why in ipairs({ "gone", "hidden", "off", "group", "soft" }) do
+            if e.rec.ends[why] then table.insert(how, why .. " " .. e.rec.ends[why]) end
+        end
+        add("%-46s x%-3d lasted %s | %s", e.key:sub(1, 46), e.total,
+            e.rec.n > 0 and string.format("%.1f..%.1fs (expect %.1fs)", e.rec.min, e.rec.max, e.rec.mid or 0) or "-", table.concat(how, ", "))
+    end
     local learned = {}
     for name in pairs(Hazards.learned) do table.insert(learned, name) end
     for name in pairs(Hazards.sized) do table.insert(learned, name .. " (by size)") end
