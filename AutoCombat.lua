@@ -25,8 +25,12 @@
                  While fighting one group, the bot stays out of the aggro range of the others.
 
     One file, a few module tables:
-      Npcs  Dungeon  Hazards  Walls  Planner  Nav  Noclip  Skills  ESP  UI  Bot
+      Npcs  Dungeon  Hazards  Walls  Planner  Nav  Noclip  Prompts  Skills  ESP  UI  Bot
     Noclip (the switch in the window, or the N key) lets the character walk through the map's walls, with or without the bot.
+    Prompts presses the game's offer of a bonus boss after the last boss (Northern Lands: Odin Reincarnation), if it shows one.
+    "Copy report" in the window puts everything the bot knows on the clipboard - what it sees, every hit it took and what
+    was around when it landed, every new part that appeared and whether it counted as an attack - for working out why it
+    misbehaves.
     Running the script again stops the previous run. The running bot is reachable as getgenv().__AutoCombat;
     getgenv().__AutoCombat.api.Bot.dump() prints a report of everything it sees (also the button in the window).
 ]]
@@ -83,7 +87,7 @@ local Config = {
     BODY_RADIUS         = 4,     -- an npc this wide counts as a point; only size beyond it adds keep-away distance
     FLANK_RANGE         = 60,
     BOSS_SIZE           = 30,    -- an npc whose body is this wide (studs) is a boss: no aggro limit, must be fought inside its area
-    BOSS_NAMES          = {},    -- extra name fragments (lowercase letters/digits) that mark a boss, e.g. { "dragon", "enchantedtree" }
+    BOSS_NAMES          = { "bobthefrostgiant", "odin" },   -- name fragments (lowercase letters/digits) that mark a boss (Northern Lands' Bob, Odin and Odin Reincarnation); add { "dragon", "enchantedtree" } ...
     NOT_BOSS_NAMES      = {},    -- ...and ones that never are
     BOSS_AREA_MARGIN    = 2,     -- stand at least this far inside the room's edge when fighting a boss
 
@@ -92,6 +96,19 @@ local Config = {
     ROOM_ARRIVE         = 15,    -- this close to a room's centre = arrived
     ADVANCE_RETRY       = 10,    -- a room we couldn't reach is retried after this long
     FINISH_WAIT         = 4,     -- nothing left to do for this long = the dungeon is complete (the next room may still load)
+
+    -- ---- the game's offers (see Prompts) ----
+    BONUS_BOSS          = true,  -- take the game's offer of a bonus boss after the last boss (Northern Lands: "Odin Reincarnation")
+    BONUS_WORDS         = { "bonus", "reincarnation" },   -- a window that says one of these words is that offer
+    ACCEPT_WORDS        = { "fight", "stay", "vote", "yes", "accept", "join" },   -- the button to press (first one found, in this order)
+    DECLINE_WORDS       = { "leave", "exit", "no", "skip", "decline", "cancel", "quit", "later", "lobby", "return", "home", "claim", "dont" },   -- never pressed
+    PROMPT_RATE         = 1.5,   -- look for the offer this often (seconds) while nothing is alive; during a fight a third as often
+    PROMPT_TRIES        = 3,     -- press the same button at most this many times (an odd number: a vote that toggles ends up on)
+    PROMPT_RETRY        = 8,     -- ...and not twice within this many seconds
+
+    -- ---- the report ----
+    HIT_LOG             = 40,    -- hits kept for the report
+    CATALOG_MAX         = 160,   -- distinct kinds of new part kept for the report
 
     -- ---- the dodge planner ----
     GRID                = 3,     -- studs per planning cell
@@ -222,7 +239,7 @@ local Config = {
 -- =====================
 -- SHARED: modules, state, helpers
 -- =====================
-local Npcs, Dungeon, Hazards, Walls, Planner, Nav, Noclip, Skills, ESP, UI, Bot = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+local Npcs, Dungeon, Hazards, Walls, Planner, Nav, Noclip, Prompts, Skills, ESP, UI, Bot = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
 local API = {}   -- filled in at the bottom: the modules, reachable as getgenv().__AutoCombat.api
 
 local State = {
@@ -283,10 +300,12 @@ local function findTool(name)
     return (bp and bp:FindFirstChild(name)) or (player.Character and player.Character:FindFirstChild(name)) or nil
 end
 
-local Log = { lines = {}, MAX = 6 }
+local Log = { lines = {}, MAX = 6, history = {}, HISTORY_MAX = 200, t0 = clock() }
 function Log.add(msg)
     table.insert(Log.lines, 1, os.date("%M:%S") .. "  " .. msg)
     while #Log.lines > Log.MAX do table.remove(Log.lines) end
+    table.insert(Log.history, string.format("%7.1f  %s", clock() - Log.t0, msg))   -- (the report keeps more than the window shows)
+    if #Log.history > Log.HISTORY_MAX then table.remove(Log.history, 1) end
 end
 
 function State.setMode(mode)
@@ -858,6 +877,9 @@ Hazards.runLearned = 0   -- names learned by the 2-hit rule this run
 Hazards.pendingDeath = nil   -- { t, strong = { [key] = entry } }: the unexplained hits just before a possible death
 Hazards.appearances = {}     -- [normalized name] = { near, other }: how often a part of that name appeared right after one of our casts
 Hazards.appearCount = 0
+Hazards.catalog = {}         -- [key] = what the new parts of one name / class / place looked like (for the report)
+Hazards.catalogCount = 0
+Hazards.catalogMissed = 0    -- kinds of part that showed up after the catalog was full
 
 function Hazards.pad()
     return Config.PADDING + Hazards.extraPad
@@ -907,6 +929,14 @@ function Hazards.isIgnored(obj)
 end
 
 -- ---- classification ----
+
+-- something this script drew: its markers are named with a leading underscore, and the path beams and the like (which have no
+-- name of their own) live in workspace._AutoCombat. Never an attack, never scenery, never a suspect.
+function Hazards.isDrawn(obj)
+    if obj.Name:sub(1, 1) == "_" then return true end
+    local drawn = workspace:FindFirstChild("_AutoCombat")
+    return drawn ~= nil and obj:IsDescendantOf(drawn)
+end
 
 function Hazards.inCharacter(obj)
     local cur = obj
@@ -973,7 +1003,7 @@ end
 
 function Hazards.classify(obj, initial)
     if not obj:IsA("BasePart") or obj.ClassName == "Terrain" or Hazards.skip[obj] then return nil end
-    if obj.Name:sub(1, 1) == "_" then return nil end   -- everything this script draws is named with a leading underscore
+    if Hazards.isDrawn(obj) then return nil end
     if Hazards.isIgnored(obj) then
         Hazards.skip[obj] = true   -- decided once: later scans skip it without even looking
         return nil
@@ -1231,7 +1261,7 @@ end
 -- Our own skills leave effect parts next to us. A name that only ever appears right after one of our casts is OUR effect, not an
 -- attack (see ownEffect); an enemy's attack shows up at other times too. Counted for every new part, attack or not.
 function Hazards.countAppearance(obj)
-    if obj.Name:sub(1, 1) == "_" then return end
+    if Hazards.isDrawn(obj) then return end
     local name = normalize(obj.Name)
     local stat = Hazards.appearances[name]
     if not stat then
@@ -1250,7 +1280,7 @@ end
 -- remembered for a moment: if something we never saw coming hits us, one of these is probably it. What it looked like
 -- (position, size) is kept up to date while it exists, so even a projectile that vanished on impact can be matched to us.
 function Hazards.noteRecent(obj)
-    if obj.Name:sub(1, 1) == "_" or Hazards.active[obj] or Hazards.isIgnored(obj) or Hazards.inCharacter(obj) then return end
+    if Hazards.isDrawn(obj) or Hazards.active[obj] or Hazards.isIgnored(obj) or Hazards.inCharacter(obj) then return end
     -- an attack that is a loose Model dropped into workspace is best known by the Model's name, not by its parts'
     local top = obj
     while top.Parent and top.Parent ~= workspace do top = top.Parent end
@@ -1274,16 +1304,122 @@ function Hazards.trackRecent(now)
     end
 end
 
+-- Every new part (not a body, not ours) is noted by name, class and where it lives, with what it looked like, how long it
+-- lasted, how often it was near us and whether it became an attack - so the report shows what the bot did NOT take for an
+-- attack as well as what it did.
+local function placeOf(obj)
+    local top = obj
+    while top.Parent and top.Parent ~= workspace do top = top.Parent end
+    if top == obj then return top, "workspace" end
+    local parent = obj.Parent
+    return top, "workspace." .. top.Name .. ((parent and parent ~= top) and ("/" .. parent.Name:gsub("%d+$", "")) or "")
+end
+
+function Hazards.catalogKey(name, class, where)
+    return normalize(Hazards.bareName(normalize(name))) .. "|" .. class .. "|" .. normalize(where)
+end
+
+function Hazards.record(obj, kind)
+    if Hazards.isDrawn(obj) or inBody(obj) or Hazards.inCharacter(obj) then return end
+    local _, where = placeOf(obj)
+    local key = Hazards.catalogKey(obj.Name, obj.ClassName, where)
+    local stat = Hazards.catalog[key]
+    if not stat then
+        if Hazards.catalogCount >= Config.CATALOG_MAX then   -- full: make room by dropping the least interesting kind (never hit us, no attack, never near)
+            local worst, worstKey, worstScore = nil, nil, math.huge
+            for k, st in pairs(Hazards.catalog) do
+                local score = st.hits * 1000 + st.attacks * 100 + st.near * 10 + st.count
+                if score < worstScore then worst, worstKey, worstScore = st, k, score end
+            end
+            if not worst or worst.hits > 0 or worst.attacks > 0 or worst.near > 0 then
+                Hazards.catalogMissed = Hazards.catalogMissed + 1
+                return
+            end
+            Hazards.catalog[worstKey] = nil
+            Hazards.catalogCount = Hazards.catalogCount - 1
+            Hazards.catalogMissed = Hazards.catalogMissed + 1
+        end
+        Hazards.catalogCount = Hazards.catalogCount + 1
+        local c = obj.Color or Color3.new(1, 1, 1)
+        stat = {
+            name = obj.Name, class = obj.ClassName, where = where, count = 0, first = clock() - Log.t0,
+            min = obj.Size, max = obj.Size, color = string.format("%02x%02x%02x", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5)),
+            material = tostring(obj.Material):gsub("^Enum%.Material%.", ""), transparency = obj.Transparency, collide = obj.CanCollide,
+            attacks = 0, near = 0, hits = 0, tracked = 0, life = 0, ended = 0,
+        }
+        Hazards.catalog[key] = stat
+    end
+    stat.count = stat.count + 1
+    local size = obj.Size
+    stat.min = Vector3.new(math.min(stat.min.X, size.X), math.min(stat.min.Y, size.Y), math.min(stat.min.Z, size.Z))
+    stat.max = Vector3.new(math.max(stat.max.X, size.X), math.max(stat.max.Y, size.Y), math.max(stat.max.Z, size.Z))
+    if kind then
+        stat.attacks = stat.attacks + 1
+        stat.kind = kind
+    end
+    if State.hrp and flat(obj.Position - State.hrp.Position).Magnitude <= 40 then stat.near = stat.near + 1 end
+    if stat.tracked < 4 then   -- how long the first few last
+        stat.tracked = stat.tracked + 1
+        local born = clock()
+        obj.Destroying:Connect(function()
+            stat.life = stat.life + (clock() - born)
+            stat.ended = stat.ended + 1
+        end)
+    end
+end
+
+-- the parts within `radius` studs of `pos` right now that are not bodies: what was around when we were hit. Parts that were
+-- there when the script started are static (floors, walls); the new ones, and the ones that count as attacks, come first.
+function Hazards.partsAt(pos, radius, limit)
+    local out = {}
+    local ok, parts = pcall(function() return workspace:GetPartBoundsInRadius(pos, radius) end)
+    if not ok or type(parts) ~= "table" then return out end
+    local seen = {}
+    for _, p in ipairs(parts) do
+        if p:IsA("BasePart") and p.ClassName ~= "Terrain" and not Hazards.isDrawn(p) and not inBody(p) and not Hazards.inCharacter(p) then
+            local _, where = placeOf(p)
+            local key = p.Name .. "|" .. where
+            if not seen[key] then
+                seen[key] = true
+                local zone = Hazards.active[p]
+                table.insert(out, {
+                    name = p.Name, class = p.ClassName, where = where, size = p.Size, static = Hazards.seen[p] == -1000,
+                    kind = zone and zone.kind or nil, transparency = p.Transparency, collide = p.CanCollide,
+                })
+            end
+        end
+    end
+    table.sort(out, function(a, b)
+        if (a.static or false) ~= (b.static or false) then return not a.static end
+        if (a.kind ~= nil) ~= (b.kind ~= nil) then return a.kind ~= nil end
+        return a.name < b.name
+    end)
+    while #out > (limit or 8) do table.remove(out) end
+    return out
+end
+
+-- a hit landed with these parts around: the new ones get the blame in the catalog
+function Hazards.creditHit(parts)
+    for _, p in ipairs(parts) do
+        if not p.static then
+            local stat = Hazards.catalog[Hazards.catalogKey(p.name, p.class, p.where)]
+            if stat then stat.hits = stat.hits + 1 end
+        end
+    end
+end
+
 function Hazards.onAdded(obj)
     if obj:IsA("BasePart") then
         Hazards.countAppearance(obj)
         Hazards.add(obj, nil, true)
+        Hazards.record(obj, Hazards.active[obj] and Hazards.active[obj].kind or nil)
         Hazards.noteRecent(obj)
     elseif obj:IsA("Model") or obj:IsA("Folder") then
         for _, d in ipairs(obj:GetDescendants()) do
             if d:IsA("BasePart") then
                 Hazards.countAppearance(d)
                 Hazards.add(d, nil, true)
+                Hazards.record(d, Hazards.active[d] and Hazards.active[d].kind or nil)
                 Hazards.noteRecent(d)
             end
         end
@@ -1717,6 +1853,16 @@ function Hazards.zoneClearance(zone, pos, pad)
     local dy = math.max(math.abs(l.Y) - (half.Y + pad + Config.VERTICAL), 0)
     local dz = math.max(math.abs(l.Z) - (half.Z + pad), 0)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+-- the attacks within `radius` studs of `pos`, as "kind name" (for the report)
+function Hazards.nearNames(pos, radius)
+    local out = {}
+    for obj, zone in pairs(Hazards.active) do
+        if Hazards.zoneClearance(zone, pos) <= radius then table.insert(out, zone.kind .. " " .. obj.Name) end
+    end
+    table.sort(out)
+    return out
 end
 
 -- how many attacks are within `radius` studs of `pos`
@@ -2573,6 +2719,202 @@ function Noclip.groundBetween(from, to)
 end
 
 -- =====================
+-- PROMPTS: the game's offers that need a click
+-- After the last boss of Northern Lands (Nightmare) the game offers a bonus boss, Odin Reincarnation ("stay and fight the bonus
+-- boss"): a vote that is only answered by clicking. A window that says one of BONUS_WORDS and has a button saying one of
+-- ACCEPT_WORDS (and none of DECLINE_WORDS) gets that button pressed - nothing else is ever pressed. The press is made the way
+-- the executor allows (firesignal, getconnections, or a real mouse click), a different one each time it has to be repeated.
+-- A vote button may toggle, so it is pressed an odd number of times at most (PROMPT_TRIES) and not twice within PROMPT_RETRY
+-- seconds: if every press toggled, it would end up on.
+-- =====================
+Prompts.last = -math.huge
+Prompts.seen = {}        -- [text] = { first, last, count }: every window that offered the bonus (for the report)
+Prompts.tries = setmetatable({}, { __mode = "k" })   -- [button] = { n, at }: presses so far
+Prompts.pressed = 0
+
+-- lowercase words of a text, rich text and apostrophes removed ("Don't" -> dont)
+local function wordsOf(text)
+    local clean = tostring(text):gsub("<[^>]*>", ""):lower():gsub("'", "")
+    local set = {}
+    for w in clean:gmatch("%a+") do set[w] = true end
+    return set
+end
+
+local function hasAny(set, list)
+    for _, w in ipairs(list) do
+        if set[w] then return w end
+    end
+    return nil
+end
+
+-- on screen: every container up to `root` is visible / enabled
+local function shown(obj, root)
+    local cur = obj
+    while cur and cur ~= root do
+        if cur:IsA("ScreenGui") then
+            if cur.Enabled == false then return false end
+        else
+            local ok, visible = pcall(function() return cur.Visible end)
+            if ok and visible == false then return false end
+        end
+        cur = cur.Parent
+    end
+    return true
+end
+
+local function isButton(obj)
+    return obj:IsA("TextButton") or obj:IsA("ImageButton")
+end
+
+-- what a button says: its own text, or the labels inside it (an image button)
+local function textOf(obj)
+    if obj:IsA("TextButton") or obj:IsA("TextLabel") then return obj.Text end
+    local parts = {}
+    for _, d in ipairs(obj:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and shown(d, obj) then table.insert(parts, d.Text) end
+    end
+    return table.concat(parts, " ")
+end
+
+-- ---- pressing a button ----
+
+local function viaFiresignal(button)
+    for _, name in ipairs({ "MouseButton1Down", "MouseButton1Click", "MouseButton1Up", "Activated" }) do
+        local signal = button[name]
+        if signal then pcall(firesignal, signal) end
+    end
+end
+
+local function viaConnections(button)
+    for _, name in ipairs({ "MouseButton1Click", "Activated" }) do
+        local signal = button[name]
+        if signal then
+            local ok, list = pcall(getconnections, signal)
+            if ok and type(list) == "table" then
+                for _, conn in ipairs(list) do
+                    pcall(function() conn:Fire() end)
+                end
+            end
+        end
+    end
+end
+
+local function viaMouse(button)
+    local vim = game:GetService("VirtualInputManager")
+    local pos, size = button.AbsolutePosition, button.AbsoluteSize
+    local x, y = pos.X + size.X / 2, pos.Y + size.Y / 2
+    local screen = button:FindFirstAncestorOfClass("ScreenGui")
+    if not (screen and screen.IgnoreGuiInset) then   -- (the top bar pushes everything down)
+        local ok, inset = pcall(function() return game:GetService("GuiService"):GetGuiInset() end)
+        if ok and inset then y = y + inset.Y end
+    end
+    vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+    task.wait(0.05)
+    vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+end
+
+-- the ways this executor can press a button, in the order they are tried
+local function methods()
+    local list = {}
+    if type(firesignal) == "function" then table.insert(list, { "firesignal", viaFiresignal }) end
+    if type(getconnections) == "function" then table.insert(list, { "getconnections", viaConnections }) end
+    table.insert(list, { "mouse click", viaMouse })
+    return list
+end
+
+function Prompts.press(button, label, context, now)
+    local t = Prompts.tries[button]
+    if not t then
+        t = { n = 0, at = -math.huge, seen = now }
+        Prompts.tries[button] = t
+    end
+    if now - t.seen > 20 then t.n = 0 end   -- it was off the table for a while: a new offer on a button the game reuses
+    t.seen = now
+    if t.n >= Config.PROMPT_TRIES or now - t.at < Config.PROMPT_RETRY then return end
+    t.n, t.at = t.n + 1, now
+    local list = methods()
+    local method = list[(t.n - 1) % #list + 1]
+    local ok, err = pcall(method[2], button)
+    Prompts.pressed = Prompts.pressed + 1
+    Log.add(string.format("Offer \"%s\": pressed \"%s\" (%s%s)", context:gsub("<[^>]*>", ""):sub(1, 36), label:gsub("<[^>]*>", ""):sub(1, 20), method[1], ok and "" or (", failed: " .. tostring(err):sub(1, 40))))
+end
+
+-- Looks at the windows on screen. `quiet` = nothing is alive (between rooms, after the last boss): the offer is looked for more
+-- often then.
+function Prompts.scan(now, quiet)
+    if not Config.BONUS_BOSS or not State.enabled or #Dungeon.rooms == 0 then return end   -- (only inside a dungeon: not in the lobby)
+    if now - Prompts.last < Config.PROMPT_RATE * (quiet and 1 or 3) then return end
+    Prompts.last = now
+    local playerGui = player:FindFirstChild("PlayerGui")
+    if not playerGui then return end
+
+    local contexts, buttons = {}, {}   -- by ScreenGui: the text that mentions the bonus / every button on it
+    for _, d in ipairs(playerGui:GetDescendants()) do
+        local button = isButton(d)
+        if button or d:IsA("TextLabel") then
+            if not (UI.gui and d:IsDescendantOf(UI.gui)) then
+                local text = textOf(d)
+                if text ~= "" then
+                    local screen = d:FindFirstAncestorOfClass("ScreenGui")
+                    if screen then
+                        local set = wordsOf(text)
+                        local bonus = hasAny(set, Config.BONUS_WORDS) ~= nil
+                        if bonus and not contexts[screen] and shown(d, playerGui) then contexts[screen] = text end
+                        if button then
+                            buttons[screen] = buttons[screen] or {}
+                            table.insert(buttons[screen], { obj = d, text = text, set = set, bonus = bonus })
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    for screen, context in pairs(contexts) do
+        local seen = Prompts.seen[context]
+        if not seen then
+            seen = { first = clock() - Log.t0, count = 0 }
+            Prompts.seen[context] = seen
+        end
+        seen.last, seen.count = clock() - Log.t0, seen.count + 1
+
+        local best, bestRank
+        for _, b in ipairs(buttons[screen] or {}) do
+            if not hasAny(b.set, Config.DECLINE_WORDS) and shown(b.obj, playerGui) then
+                local rank
+                for i, w in ipairs(Config.ACCEPT_WORDS) do
+                    if b.set[w] then
+                        rank = i
+                        break
+                    end
+                end
+                if not rank and b.bonus and b.set.boss then rank = #Config.ACCEPT_WORDS + 1 end   -- "Bonus Boss": the button itself says it
+                if rank and (not bestRank or rank < bestRank) then best, bestRank = b, rank end
+            end
+        end
+        if best then Prompts.press(best.obj, best.text, context, now) end
+    end
+end
+
+-- what is on screen that can be pressed, for the report: the offer's exact words, whatever they are
+function Prompts.snapshot(limit)
+    local out = {}
+    local playerGui = player:FindFirstChild("PlayerGui")
+    if not playerGui then return out end
+    for _, d in ipairs(playerGui:GetDescendants()) do
+        if isButton(d) and not (UI.gui and d:IsDescendantOf(UI.gui)) and shown(d, playerGui) then
+            local text = textOf(d):gsub("<[^>]*>", ""):gsub("%s+", " ")
+            if text ~= "" and text ~= " " then
+                local screen = d:FindFirstAncestorOfClass("ScreenGui")
+                table.insert(out, string.format("[%s] %s", screen and screen.Name or "?", text:sub(1, 50)))
+                if #out >= (limit or 30) then break end
+            end
+        end
+    end
+    return out
+end
+
+-- =====================
 -- SKILLS: ability detection and casting
 -- A skill is a Tool with a numeric `cooldown` (-0.1 = ready, otherwise counting down) and a `cooldownLength`. They are
 -- scanned from the backpack at runtime, so the bot works with any loadout - nothing here is tied to Inner Rage / Gale
@@ -3400,6 +3742,7 @@ function ESP.drawPath(waypoints)
         local len = (b - a).Magnitude
         if len > 0 then
             local beam = Instance.new("Part")
+            beam.Name = "_Path"
             beam.Anchored = true
             beam.CanCollide = false
             beam.CanQuery = false
@@ -3895,14 +4238,14 @@ function UI.build()
         return b
     end
 
-    -- third row: the report, and forgetting what it learned
+    -- third row: the report (to the clipboard), and forgetting what it learned
     local switches3 = Instance.new("Frame")
     switches3.Size = UDim2.new(1, 0, 0, 28)
     switches3.BackgroundTransparency = 1
     switches3.LayoutOrder = nextOrder(body)
     switches3.Parent = body
     layout(switches3, 6, true)
-    button(switches3, "Report", function() pcall(Bot.dump) end)
+    button(switches3, "Copy report", function() pcall(Bot.dump) end)
     UI.refs.forget = button(switches3, "Forget saved", function() pcall(Hazards.forgetAll) end)
 
     -- the dungeon
@@ -4145,6 +4488,7 @@ Bot.lastUnseen = 0
 Bot.lastDetect = 0
 Bot.strafe = { spin = 1, flipAt = 0, last = -100, dir = nil }   -- the lane we are running along
 Bot.stopped = false
+Bot.hits = {}                -- every real hit we took, and what was around when it landed (for the report)
 
 -- one bad frame (a part vanishing mid-death ...) must never kill the loop or flood the output
 function Bot.reportError(label, err)
@@ -4188,6 +4532,23 @@ function Bot.notAlive()
         Bot.lastUI = now
         pcall(UI.update)
     end
+end
+
+-- Every real hit goes in the report: how bad, what we were doing, which npc was close, which attacks the bot knew about nearby and
+-- which parts were around us. "UNSEEN" = nothing the bot knew explains it - the ones to look at.
+function Bot.logHit(amount, pos)
+    local max = math.max(State.hum.MaxHealth, 1)
+    if amount < math.max(1, max * 0.01) then return end
+    local npc, surface = Npcs.nearest(pos, Npcs.list)
+    local zones = Hazards.nearNames(pos, 8)
+    local parts = Hazards.partsAt(pos, 7, 8)
+    Hazards.creditHit(parts)
+    table.insert(Bot.hits, {
+        t = clock() - Log.t0, amount = amount, frac = amount / max, left = math.max(0, State.hum.Health) / max, mode = State.mode,
+        npc = npc and npc.model.Name or nil, npcDist = npc and surface or nil, zones = zones, parts = parts,
+        why = #zones > 0 and "known attack" or ((npc and surface < Config.MIN_DISTANCE + 4) and "npc in melee range" or "UNSEEN"),
+    })
+    while #Bot.hits > Config.HIT_LOG do table.remove(Bot.hits, 1) end
 end
 
 -- Something hurt us. If the attacks we know about don't explain it (none near us, no npc within reach), it was something
@@ -4238,6 +4599,7 @@ function Bot.onCharacter(char, initial)
         local lastHealth = hum.Health
         hum.HealthChanged:Connect(function(health)
             if health < lastHealth and State.enabled and clock() >= State.shieldUntil then
+                pcall(Bot.logHit, lastHealth - health, root.Position)
                 pcall(Bot.onDamage, lastHealth - health, root.Position)
             end
             lastHealth = health
@@ -4246,6 +4608,11 @@ function Bot.onCharacter(char, initial)
         hum.Died:Connect(function()
             if State.wasAlive then
                 State.wasAlive = false
+                local blamed = {}
+                for _, entry in pairs(Hazards.pendingDeath and Hazards.pendingDeath.strong or {}) do table.insert(blamed, entry.raw) end
+                table.sort(blamed)
+                table.insert(Bot.hits, { t = clock() - Log.t0, death = true, blame = blamed })
+                while #Bot.hits > Config.HIT_LOG do table.remove(Bot.hits, 1) end
                 pcall(Hazards.onDeath)   -- was it something we never registered as an attack? then it is one from now on
                 State.deaths = State.deaths + 1
                 Bot.reset("Died (" .. State.deaths .. " so far)")
@@ -4725,6 +5092,8 @@ function Bot.step()
     Npcs.refresh(0)
     local me = State.hrp.Position
     Dungeon.refresh(now, me)
+    local okOffer, errOffer = pcall(Prompts.scan, now, #Npcs.list == 0)   -- the bonus boss offer (see Prompts)
+    if not okOffer then Bot.reportError("prompts", errOffer) end
     Npcs.pool = Dungeon.pool(Npcs.list, me)
     Npcs.buildGroups()
     Skills.watch(now)
@@ -4840,15 +5209,32 @@ local function describeModel(model)
     return table.concat(parts, ", ")
 end
 
-function Bot.dump()
+local function sizeText(v)
+    return string.format("%.0fx%.0fx%.0f", v.X, v.Y, v.Z)
+end
+
+local function describePart(p)
+    return string.format("%s(%s%s %s%s)", p.name, p.class, p.kind and (", " .. p.kind) or "", sizeText(p.size), p.static and ", static" or "")
+end
+
+local function oneLine(text)
+    return (tostring(text):gsub("<[^>]*>", ""):gsub("%s+", " "))
+end
+
+-- everything the bot knows, as text
+function Bot.reportText()
     local out = {}
     local function add(fmt, ...) table.insert(out, string.format(fmt, ...)) end
     local now = clock()
     local me = State.hrp and State.hrp.Position
 
     add("=== AutoCombat report ===")
-    add("mode %s | enabled %s | kills %d | deaths %d | shield %.1fs | caution +%.1f", State.mode, tostring(State.enabled), State.kills, State.deaths, Hazards.shieldLeft, Hazards.extraPad)
+    add("mode %s | enabled %s | noclip %s | kills %d | deaths %d | shield %.1fs | caution +%.1f | run time %.0fs", State.mode, tostring(State.enabled),
+        tostring(State.noclip), State.kills, State.deaths, Hazards.shieldLeft, Hazards.extraPad, now - State.startedAt)
     if me then add("position %.0f, %.0f, %.0f | walkspeed %.0f | health %.0f/%.0f", me.X, me.Y, me.Z, State.hum.WalkSpeed, State.hum.Health, State.hum.MaxHealth) end
+    add("place %s | executor %s | firesignal %s getconnections %s setclipboard %s writefile %s", tostring(game.PlaceId),
+        type(identifyexecutor) == "function" and tostring((identifyexecutor())) or "?", tostring(type(firesignal) == "function"),
+        tostring(type(getconnections) == "function"), tostring(type(setclipboard) == "function"), tostring(type(writefile) == "function"))
 
     add("--- skills (stand reach %.0f) ---", Skills.reach)
     for _, sk in ipairs(Skills.list) do
@@ -4883,9 +5269,83 @@ function Bot.dump()
     if #learned > 0 then add("learned attacks: %s", table.concat(learned, ", ")) end
     add("saved attacks: %d (%s)", Hazards.savedCount(), Hazards.canPersist() and Config.LEARN_FILE or "no file access - this run only")
 
-    local text = table.concat(out, "\n")
-    print(text)
-    Log.add("Report printed to the console")
+    -- every hit, and what was around: "UNSEEN" ones are attacks the bot does not know
+    add("--- hits taken: %d (oldest first) ---", #Bot.hits)
+    for _, h in ipairs(Bot.hits) do
+        if h.death then
+            add("%7.1fs  DIED | unexplained hits blamed on: %s", h.t, #h.blame > 0 and table.concat(h.blame, ", ") or "nothing")
+        else
+            local parts = {}
+            for _, p in ipairs(h.parts) do table.insert(parts, describePart(p)) end
+            add("%7.1fs  -%.0f%% (%.0f%% left) [%s] while %s | npc %s%s | known attacks within 8 studs: %s | parts within 7 studs: %s", h.t, h.frac * 100, h.left * 100,
+                h.why, h.mode, h.npc or "-", h.npcDist and string.format(" %.0f studs", h.npcDist) or "",
+                #h.zones > 0 and table.concat(h.zones, ", ") or "none", #parts > 0 and table.concat(parts, ", ") or "none")
+        end
+    end
+
+    -- every kind of new part and what the bot made of it: the ones that are NOT attacks but were near us / hit us are the gaps
+    local kinds = {}
+    for _, stat in pairs(Hazards.catalog) do table.insert(kinds, stat) end
+    table.sort(kinds, function(a, b)
+        if a.hits ~= b.hits then return a.hits > b.hits end
+        if (a.attacks > 0) ~= (b.attacks > 0) then return a.attacks > 0 end
+        if a.near ~= b.near then return a.near > b.near end
+        return a.count > b.count
+    end)
+    add("--- new parts that appeared: %d kinds%s ---", #kinds, Hazards.catalogMissed > 0 and (" (+" .. Hazards.catalogMissed .. " more not kept)") or "")
+    for i = 1, math.min(#kinds, 50) do
+        local st = kinds[i]
+        local size = (st.min == st.max) and sizeText(st.min) or (sizeText(st.min) .. ".." .. sizeText(st.max))
+        add("%-22s %-9s %-20s x%-4d size %s | #%s %s transp %.1f%s | life %s | near %d | hits %d | %s", st.name:sub(1, 22), st.class, st.where:sub(1, 30), st.count,
+            size, st.color, st.material, st.transparency, st.collide and " solid" or "", st.ended > 0 and string.format("%.1fs", st.life / st.ended) or "-",
+            st.near, st.hits, st.attacks > 0 and string.format("%s (%d of %d)", st.kind, st.attacks, st.count) or "NOT an attack")
+    end
+
+    add("--- offers: bonus boss %s, buttons pressed %d ---", Config.BONUS_BOSS and "on" or "off", Prompts.pressed)
+    for text, seen in pairs(Prompts.seen) do add("offer seen: \"%s\" x%d (%.0fs - %.0fs)", oneLine(text):sub(1, 80), seen.count, seen.first, seen.last) end
+    local snap = Prompts.snapshot(30)
+    add("buttons on screen now: %s", #snap > 0 and table.concat(snap, " | ") or "none")
+
+    local remotes = ReplicatedStorage:FindFirstChild("remotes")
+    if remotes then
+        local names = {}
+        for _, r in ipairs(remotes:GetChildren()) do table.insert(names, r.Name .. (r:IsA("RemoteFunction") and "()" or "")) end
+        table.sort(names)
+        add("--- remotes (%d): %s", #names, table.concat(names, ", "):sub(1, 1200))
+    end
+
+    add("--- log (newest last) ---")
+    local first = math.max(1, #Log.history - 79)
+    for i = first, #Log.history do add("%s", Log.history[i]) end
+    return table.concat(out, "\n")
+end
+
+-- the report, printed to the console, put on the clipboard and saved as a file (whatever this executor can do)
+function Bot.dump()
+    local text = Bot.reportText()
+    -- the console cuts off long prints: a few lines at a time
+    local chunk, size = {}, 0
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        table.insert(chunk, line)
+        size = size + #line + 1
+        if size > 3000 then
+            print(table.concat(chunk, "\n"))
+            chunk, size = {}, 0
+        end
+    end
+    if #chunk > 0 then print(table.concat(chunk, "\n")) end
+
+    local copy = (type(setclipboard) == "function" and setclipboard) or env.toclipboard or env.set_clipboard
+    local copied = type(copy) == "function" and pcall(copy, text)
+    local saved = false
+    if type(writefile) == "function" then
+        pcall(function()
+            if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder("AutoCombat") then makefolder("AutoCombat") end
+            writefile("AutoCombat/report.txt", text)
+            saved = true
+        end)
+    end
+    Log.add(copied and "Report copied to the clipboard" or (saved and "Report saved to AutoCombat/report.txt" or "Report printed to the console"))
     return text
 end
 
@@ -4974,6 +5434,6 @@ function Bot.boot()
 end
 
 API.Config, API.State, API.Log, API.Npcs, API.Dungeon, API.Hazards, API.Walls = Config, State, Log, Npcs, Dungeon, Hazards, Walls
-API.Planner, API.Nav, API.Noclip, API.Skills, API.ESP, API.UI, API.Bot = Planner, Nav, Noclip, Skills, ESP, UI, Bot
+API.Planner, API.Nav, API.Noclip, API.Prompts, API.Skills, API.ESP, API.UI, API.Bot = Planner, Nav, Noclip, Prompts, Skills, ESP, UI, Bot
 
 Bot.boot()
