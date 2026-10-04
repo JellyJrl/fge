@@ -9,6 +9,9 @@
       2. SURVIVE    Planner   a space-time search over the whole arena: every attack at once, each with its own timing,
                               plus walls and the npcs' own bodies. It finds the quickest way to a spot that stays safe,
                               and re-plans ten times a second. While nothing threatens us it stays put.
+                              Attacks are predicted forward, not just read as they are: a moving one by its velocity, a
+                              beam that turns (a boss's rotating beams) by its turning, and an attack that stays longer
+                              than it says is learned the first time it hurts (Hazards.windows / Hazards.heat).
                               In a fight the bot never stands still: it circles its target (the Move switch), so an attack
                               aimed at where it stands lands where it WAS, and every dodge starts from a run.
                               After a respawn the 5s immortality is used: attacks that end before it does are ignored, the
@@ -132,6 +135,10 @@ local Config = {
     PRECAST_SAFETY      = 0.35,  -- want to be out of a precast zone this long BEFORE it fires
     HITBOX_ASSUME       = 1.5,   -- a hitbox of unknown length is assumed to last this much longer (re-assumed every plan)
     PREDICT_MAX         = 3.0,   -- seconds ahead a MOVING attack is extrapolated (sweeping beams ...), then assumed to stop
+    SPIN_MIN            = 0.08,  -- an attack turning faster than this (rad/s) is a ROTATING beam: its swept area is predicted, and it stays dangerous while it turns
+    SPIN_STEP           = 0.12,  -- seconds between the samples of a rotating beam's sweep
+    LINGER_MAX          = 12,    -- an attack whose stated time is over but whose part is still there: not stood in, crossed only at a price, this long
+    LINGER_COST         = 1.5,   -- ...seconds of walking each cell of it costs when crossing
     ORB_NAME            = "battlemageorb",
     ORB_PADDING         = 3,
     ORB_HORIZON         = 4.0,   -- an orb is assumed to keep flying this long
@@ -156,6 +163,7 @@ local Config = {
     SUSPECT_RADIUS      = 30,    -- ...if they were this close to us
     SUSPECT_HITS        = 2,     -- a suspect that adds up to this many unseen hits is treated as an attack for the rest of this run
     SUSPECT_WEAK        = 0.34,  -- ...an unseen hit counts this much for a part that merely appeared nearby (1 for one that was touching us)
+    HEAVY_HIT           = 0.4,   -- a single unseen hit that takes this share of our health: whatever was touching us is an attack at once (and saved), no second hit needed
 
     -- Learning from deaths: the part that was touching us at the unexplained hits before a death is saved as an attack.
     LEARN_PERSIST       = true,  -- keep it in a file (needs the executor's writefile / readfile); false = this run only
@@ -877,6 +885,9 @@ Hazards.runLearned = 0   -- names learned by the 2-hit rule this run
 Hazards.pendingDeath = nil   -- { t, strong = { [key] = entry } }: the unexplained hits just before a possible death
 Hazards.appearances = {}     -- [normalized name] = { near, other }: how often a part of that name appeared right after one of our casts
 Hazards.appearCount = 0
+Hazards.lingering = {}       -- [part] = zone: hitboxes whose stated time is over but whose part is still there (see Hazards.windows)
+Hazards.persistent = {}      -- [name key] = true: this attack stays dangerous after its stated time (learned from being hit by it)
+Hazards.spinMemory = {}      -- turning beams that just ended: { t, spin, px, pz, cf, size } - the part that takes over keeps turning (precast -> hitbox)
 Hazards.catalog = {}         -- [key] = what the new parts of one name / class / place looked like (for the report)
 Hazards.catalogCount = 0
 Hazards.catalogMissed = 0    -- kinds of part that showed up after the catalog was full
@@ -929,6 +940,16 @@ function Hazards.isIgnored(obj)
 end
 
 -- ---- classification ----
+
+-- is this part (part of) a body - a character, an npc? Bodies are never attacks.
+function Hazards.inBody(obj)
+    local cur = obj.Parent
+    while cur and cur ~= workspace do
+        if cur:IsA("Model") and cur:FindFirstChildOfClass("Humanoid") then return true end
+        cur = cur.Parent
+    end
+    return false
+end
 
 -- something this script drew: its markers are named with a leading underscore, and the path beams and the like (which have no
 -- name of their own) live in workspace._AutoCombat. Never an attack, never scenery, never a suspect.
@@ -1070,6 +1091,8 @@ function Hazards.newZone(obj, kind, initial, cf, size, isModel)
         cf = cf, size = size, pos = cf.Position,
         vel = Vector3.zero, flatVel = Vector3.zero, moving = false,
         lastPos = cf.Position, lastT = now,
+        key = Hazards.bareName(normalize(obj.Name)),   -- what its kind of attack is called (for what is learned about it)
+        spin = 0, rotating = false, yawU = nil, yawHist = {}, px = 0, pz = 0,   -- turning: rad/s, and the point it turns about
         radius = 0,
     }
 end
@@ -1091,6 +1114,32 @@ function Hazards.watch(obj)
     end)
 end
 
+-- A new attack where a turning beam just was (and about the same size, where that beam would have got to) is the same beam
+-- under a new part: it carries on turning the same way from its first frame, instead of standing still for the ~0.3s it takes
+-- to measure it again.
+function Hazards.adoptSpin(zone)
+    local now = clock()
+    for i = #Hazards.spinMemory, 1, -1 do
+        local m = Hazards.spinMemory[i]
+        local dt = now - m.t
+        if dt > 0.8 then
+            table.remove(Hazards.spinMemory, i)
+        elseif math.abs(zone.size.X - m.size.X) <= 0.15 * math.max(zone.size.X, m.size.X) + 0.5
+            and math.abs(zone.size.Z - m.size.Z) <= 0.15 * math.max(zone.size.Z, m.size.Z) + 0.5 then
+            -- where the old beam's centre would be by now, turning about its pivot
+            local rx, rz = m.cf.Position.X - m.px, m.cf.Position.Z - m.pz
+            local th = m.spin * dt
+            local c, s = math.cos(th), math.sin(th)
+            local ex, ez = m.px + rx * c + rz * s, m.pz - rx * s + rz * c
+            if flat(Vector3.new(ex, 0, ez) - Vector3.new(zone.pos.X, 0, zone.pos.Z)).Magnitude <= 4 then
+                zone.spin, zone.px, zone.pz, zone.rotating = m.spin, m.px, m.pz, true
+                table.remove(Hazards.spinMemory, i)
+                return
+            end
+        end
+    end
+end
+
 function Hazards.add(obj, initial, fromEvent)
     if Hazards.active[obj] or Hazards.skip[obj] then return end
     if Hazards.expired[obj] then
@@ -1102,6 +1151,8 @@ function Hazards.add(obj, initial, fromEvent)
     if not kind then return end
 
     local zone = Hazards.newZone(obj, kind, initial, obj.CFrame, obj.Size, false)
+    zone.body = Hazards.inBody(obj)
+    Hazards.adoptSpin(zone)
     if kind == "orb" then zone.radius = Hazards.orbRadius(obj) end
     if kind == "precast" then   -- the npc's attackSpeed is the whole sequence's length
         local owner = Npcs.ownerOf(obj.Name, zone.pos)
@@ -1146,8 +1197,13 @@ function Hazards.addModel(model, initial)
 end
 
 function Hazards.remove(obj)
+    Hazards.lingering[obj] = nil
     local zone = Hazards.active[obj]
     if not zone then return end
+    if zone.rotating then   -- the game usually replaces the precast by a hitbox at the same pose: that one is turning too
+        table.insert(Hazards.spinMemory, { t = clock(), spin = zone.spin, px = zone.px, pz = zone.pz, cf = zone.cf, size = zone.size })
+        while #Hazards.spinMemory > 8 do table.remove(Hazards.spinMemory, 1) end
+    end
     Hazards.active[obj] = nil
     State.ignoreDirty = true
     ESP.detach(zone)
@@ -1160,6 +1216,10 @@ function Hazards.expire(obj)
     local zone = Hazards.active[obj]
     Hazards.expired[obj] = true
     Hazards.remove(obj)
+    if zone and obj.Parent and Config.LINGER_MAX > 0 then   -- over by its own account, but still there: see Hazards.windows
+        zone.endedAt = clock()
+        Hazards.lingering[obj] = zone
+    end
     local model = zone and obj.Parent
     if model and model ~= workspace and model:IsA("Model") then
         for _, d in ipairs(model:GetDescendants()) do
@@ -1190,8 +1250,57 @@ function Hazards.refreshGeometry(obj, zone)
     zone.pos = zone.cf.Position
 end
 
+-- How fast is this attack turning, and about what point? A beam that rotates round a boss (the Midgardian Champion's dual
+-- beams) is where it will be a moment from now, not where it is: its yaw is followed over the last ~0.8s (robust against a
+-- game that only replicates its position twenty times a second), the point it turns about follows from how its centre moves
+-- (a centre that stays put turns about itself), and from then on the area it will sweep is predicted (Hazards.occupies,
+-- Planner). A rotating beam stays dangerous for as long as it turns: it is not "over" when its stated duration is.
+function Hazards.trackSpin(zone, now)
+    if zone.kind == "orb" or zone.body then return end   -- (a ball spins about itself; a weapon swings - neither is a beam)
+    local lv = zone.cf.LookVector
+    local ll = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
+    if ll > 0.2 then
+        local yaw = math.atan2(lv.X, lv.Z)
+        if zone.lastYaw then
+            local d = yaw - zone.lastYaw
+            if d > math.pi then d = d - 2 * math.pi elseif d < -math.pi then d = d + 2 * math.pi end
+            zone.yawU = (zone.yawU or 0) + d
+        else
+            zone.yawU = 0
+        end
+        zone.lastYaw = yaw
+        local hist = zone.yawHist
+        if #hist == 0 or now - hist[#hist][1] >= 0.05 then table.insert(hist, { now, zone.yawU }) end
+        while #hist > 2 and now - hist[1][1] > 0.8 do table.remove(hist, 1) end
+        local first, last = hist[1], hist[#hist]
+        if last[1] - first[1] >= 0.3 then
+            zone.spin = (last[2] - first[2]) / (last[1] - first[1])
+            zone.measured = true   -- (until then a spin handed over by the beam this one replaced stands)
+        end
+    end
+    local was = zone.rotating
+    zone.rotating = math.abs(zone.spin) > (was and Config.SPIN_MIN * 0.6 or Config.SPIN_MIN)
+    if zone.rotating and zone.measured then
+        local vx, vz = zone.vel.X, zone.vel.Z
+        if vx * vx + vz * vz < 0.5 then
+            zone.px, zone.pz = zone.pos.X, zone.pos.Z
+        else
+            zone.px, zone.pz = zone.pos.X + vz / zone.spin, zone.pos.Z - vx / zone.spin
+        end
+        local dx, dz = zone.px - zone.pos.X, zone.pz - zone.pos.Z
+        if dx * dx + dz * dz > 400 * 400 then zone.rotating = false end   -- (it turns about something absurdly far away: it just moves)
+    end
+end
+
 function Hazards.update(now)
     Hazards.trackRecent(now)
+    for obj, zone in pairs(Hazards.lingering) do
+        if not obj.Parent or now - (zone.endedAt or now) > Config.LINGER_MAX then
+            Hazards.lingering[obj] = nil
+        else
+            Hazards.refreshGeometry(obj, zone)
+        end
+    end
     for obj, zone in pairs(Hazards.active) do
         if not obj.Parent then
             Hazards.remove(obj)
@@ -1201,11 +1310,19 @@ function Hazards.update(now)
             -- velocity of EVERY attack: moving hitboxes / sweeping beams are extrapolated, not just orbs
             local dt = now - zone.lastT
             if dt > 0 then
-                zone.vel = zone.vel:Lerp((zone.pos - zone.lastPos) / dt, 0.5)
+                local inst = (zone.pos - zone.lastPos) / dt
+                if inst.Magnitude > 300 then   -- a part made at the origin and put in place a moment later, or moved in one jump: not a speed
+                    zone.vel = Vector3.zero
+                    zone.yawHist, zone.lastYaw = {}, nil
+                else
+                    zone.vel = zone.vel:Lerp(inst, 0.5)
+                end
                 zone.lastPos = zone.pos
                 zone.lastT = now
             end
             zone.moving = flat(zone.vel).Magnitude > 0.7
+            if not zone.rotating and #Hazards.spinMemory > 0 and now - zone.born < 0.5 then Hazards.adoptSpin(zone) end   -- (positioned just after it appeared?)
+            Hazards.trackSpin(zone, now)
 
             local age = now - zone.born
             if zone.kind == "orb" then
@@ -1218,10 +1335,10 @@ function Hazards.update(now)
                     zone.nextResolve = now + 0.1
                     Hazards.resolve(zone, now)
                 end
-                if zone.duration and age >= zone.duration + Config.PRECAST_SAFETY + 0.05 then   -- (its window already counts the safety margin)
+                if zone.duration and not zone.rotating and not zone.hot and not Hazards.persistent[zone.key] and age >= zone.duration + Config.PRECAST_SAFETY + 0.05 then   -- (its window already counts the safety margin)
                     Hazards.expire(obj)
                 end
-            elseif zone.kind == "unknown" and age > Config.UNKNOWN_MAX_AGE then
+            elseif zone.kind == "unknown" and not zone.rotating and age > Config.UNKNOWN_MAX_AGE then
                 Hazards.dismiss(obj)   -- around far longer than any attack: scenery
             end
         end
@@ -1248,15 +1365,7 @@ function Hazards.scan(now)
     end
 end
 
--- is this part (part of) a body - a character, an npc? Bodies are never attacks.
-local function inBody(obj)
-    local cur = obj.Parent
-    while cur and cur ~= workspace do
-        if cur:IsA("Model") and cur:FindFirstChildOfClass("Humanoid") then return true end
-        cur = cur.Parent
-    end
-    return false
-end
+local inBody = Hazards.inBody   -- (defined with the classification above)
 
 -- Our own skills leave effect parts next to us. A name that only ever appears right after one of our casts is OUR effect, not an
 -- attack (see ownEffect); an enemy's attack shows up at other times too. Counted for every new part, attack or not.
@@ -1452,7 +1561,7 @@ end
 -- actually touching us counts far more than one that merely appeared nearby. A suspect that adds up to SUSPECT_HITS is
 -- treated as an attack for the rest of this run. Those touching us are also remembered for a few seconds: if this hit
 -- turns out to be the one that kills us, they are saved (Hazards.onDeath). Returns the suspects' names (for the log).
-function Hazards.blame(pos)
+function Hazards.blame(pos, heavy)
     local now = clock()
     local order, seen = {}, {}
     local pending = Hazards.pendingDeath
@@ -1469,7 +1578,7 @@ function Hazards.blame(pos)
             if not seen[r.name] then
                 seen[r.name] = true
                 table.insert(order, r.raw)
-                Hazards.suspects[r.name] = (Hazards.suspects[r.name] or 0) + (hit and 1 or Config.SUSPECT_WEAK)
+                Hazards.suspects[r.name] = (Hazards.suspects[r.name] or 0) + (hit and (heavy and Config.SUSPECT_HITS or 1) or (heavy and Config.SUSPECT_WEAK * 2 or Config.SUSPECT_WEAK))
                 if Hazards.suspects[r.name] >= Config.SUSPECT_HITS then
                     Hazards.learn(r.name, r.size, r.raw)
                     Hazards.runLearned = Hazards.runLearned + 1
@@ -1483,6 +1592,18 @@ function Hazards.blame(pos)
         end
     end
     Hazards.surprise = math.min(Config.SURPRISE_MAX, Hazards.surprise + Config.SURPRISE_PAD)
+    if heavy then   -- one hit that big is evidence enough: do not wait for the death
+        local names = {}
+        for _, entry in pairs(pending.strong) do
+            Hazards.register(entry)
+            table.insert(names, entry.raw)
+        end
+        if #names > 0 then   -- (they stay on the list: a death right after still says it, and counts)
+            table.sort(names)
+            Log.add("Learned from one heavy hit: " .. table.concat(names, ", "):sub(1, 50))
+            pcall(Hazards.writeSaved)
+        end
+    end
     return order
 end
 
@@ -1588,8 +1709,12 @@ function Hazards.writeSaved()
     end
     table.sort(list, function(a, b) return (a.t or 0) > (b.t or 0) end)
     while #list > Config.LEARN_MAX do table.remove(list) end
+    local persistent = {}   -- the attacks that outlast their time: a hit to find out, so worth keeping
+    for key in pairs(Hazards.persistent) do table.insert(persistent, key) end
+    table.sort(persistent)
+    while #persistent > 60 do table.remove(persistent) end
     local ok, err = pcall(function()
-        local text = HttpService:JSONEncode({ version = Config.LEARN_VERSION, attacks = list })
+        local text = HttpService:JSONEncode({ version = Config.LEARN_VERSION, attacks = list, persistent = persistent })
         if type(isfolder) == "function" and type(makefolder) == "function" then
             local folder = Config.LEARN_FILE:match("^(.*)/[^/]*$")
             if folder and not isfolder(folder) then makefolder(folder) end
@@ -1666,6 +1791,17 @@ function Hazards.loadSaved()
         end
     end
     if n > 0 then Log.add(string.format("Loaded %d saved attack(s) from earlier deaths", n)) end
+    if type(data.persistent) == "table" then
+        local p = 0
+        for _, key in ipairs(data.persistent) do
+            if p >= 60 then break end
+            if type(key) == "string" and key:match("^%w+$") and #key <= 60 and not Hazards.nameIgnored(key) then
+                Hazards.persistent[key] = true
+                p = p + 1
+            end
+        end
+        if p > 0 then Log.add(string.format("Loaded %d attack(s) known to outlast their time", p)) end
+    end
 end
 
 -- a name that was learned (or saved) by mistake: it is not an attack
@@ -1685,7 +1821,7 @@ end
 
 -- throw away everything learned (this run's and the saved file)
 function Hazards.forgetAll()
-    Hazards.learned, Hazards.sized, Hazards.saved, Hazards.suspects = {}, {}, {}, {}
+    Hazards.learned, Hazards.sized, Hazards.saved, Hazards.suspects, Hazards.persistent = {}, {}, {}, {}, {}
     Hazards.runLearned, Hazards.pendingDeath = 0, nil
     Hazards.skip = setmetatable({}, { __mode = "k" })
     pcall(function()
@@ -1710,11 +1846,16 @@ end
 -- it fires (PRECAST_SAFETY) for as long as it lasts (the hitbox that replaces it covers the same ground).
 function Hazards.window(zone, now)
     local age = now - zone.born
+    if (zone.hot or Hazards.persistent[zone.key]) and zone.kind ~= "orb" then   -- known to outlast its stated time: dangerous while the part is there
+        return (zone.kind == "precast") and math.max(0, Config.PRECAST_DELAY - age - Config.PRECAST_SAFETY) or 0, math.huge
+    end
     if zone.kind == "precast" then
         -- dangerous from just before it fires, until its sequence (precast + hitbox) is over - when the npc says how long that is
         local off = zone.seq and (math.max(zone.seq, Config.PRECAST_DELAY + 1) - age + Config.PRECAST_SAFETY) or math.huge
+        if zone.rotating then off = math.huge end   -- (a beam that is still turning is still there)
         return math.max(0, Config.PRECAST_DELAY - age - Config.PRECAST_SAFETY), off
     elseif zone.kind == "hitbox" then
+        if zone.rotating then return 0, math.huge end
         if zone.duration then
             return 0, math.max(0, zone.duration - age) + Config.PRECAST_SAFETY
         end
@@ -1731,16 +1872,56 @@ end
 -- see the harmless part, and the bot is clear of the zones the instant the shield runs out.
 Hazards.shieldLeft = 0
 
+-- An attack that is over by its own account (its precast ran past the npc's attackSpeed, a hitbox past its duration) while its
+-- part is still there is probably a remnant - but may be an attack that simply lasts longer than it says. So it is a SOFT
+-- zone for LINGER_MAX seconds: not a place to stop or end a run in, crossed only at a price, never a reason to dodge from afar.
+-- Being hit inside one makes it (and every attack of its name) hard for good: see Hazards.heat.
 function Hazards.windows(now)
     local list = {}
     local shield = Hazards.shieldLeft
+    local linger = Config.LINGER_MAX > 0
     for _, zone in pairs(Hazards.active) do
         local on, off = Hazards.window(zone, now)
         if off > shield then
             table.insert(list, { zone = zone, on = math.max(on, shield), off = off })
+        elseif linger and zone.kind ~= "orb" then
+            zone.endedAt = zone.endedAt or now
+            if now - zone.endedAt < Config.LINGER_MAX then table.insert(list, { zone = zone, on = shield, off = math.huge, soft = true }) end
+        end
+    end
+    if linger then
+        for _, zone in pairs(Hazards.lingering) do
+            if now - zone.endedAt < Config.LINGER_MAX then table.insert(list, { zone = zone, on = shield, off = math.huge, soft = true }) end
         end
     end
     return list
+end
+
+-- We were hit at `pos`. If that was inside a soft zone and nothing live explains it, that attack outlasts what it says: it is
+-- hard from now on, and so is every attack of its name this run. Returns the names.
+function Hazards.heat(pos, wins)
+    local named = {}
+    for _, w in ipairs(wins) do
+        if w.soft and Hazards.occupies(w.zone, 0, math.huge, pos, 0, 0, Config.PADDING) then
+            local zone = w.zone
+            if not zone.hot then
+                zone.hot = true
+                zone.endedAt = nil
+                Hazards.persistent[zone.key] = true
+                if Hazards.lingering[zone.obj] then   -- back among the live attacks
+                    Hazards.lingering[zone.obj] = nil
+                    Hazards.expired[zone.obj] = nil
+                    Hazards.active[zone.obj] = zone
+                    State.ignoreDirty = true
+                    ESP.attach(zone)
+                end
+                table.insert(named, zone.key)
+                Log.add("Learned: " .. zone.key .. " stays dangerous after its time is up")
+                pcall(Hazards.writeSaved)
+            end
+        end
+    end
+    return named
 end
 
 -- Flat distance from `pos` to the path an orb sweeps between t0 and t1 seconds from now. Orbs are judged by WHERE THEY
@@ -1794,6 +1975,27 @@ function Hazards.occupies(zone, on, off, pos, t0, t1, pad)
         return orbDistance(zone, pos, a, b) <= zone.radius + (pad - Config.PADDING)
     end
     local half = zone.size / 2
+    if zone.rotating then   -- turning about (px, pz): where the spot is, in the beam's frame, while it turns
+        local a2, b2 = math.min(a, Config.PREDICT_MAX), math.min(b, Config.PREDICT_MAX)
+        if math.abs(pos.Y - zone.cf.Position.Y) > half.Y + pad + Config.VERTICAL then return false end
+        local rx, rz = pos.X - zone.px, pos.Z - zone.pz
+        local steps = math.max(1, math.ceil((b2 - a2) / Config.SPIN_STEP))
+        local ds = (b2 - a2) / steps
+        local th = zone.spin * a2
+        local c, s = math.cos(th), math.sin(th)
+        local x0, z0 = rx * c - rz * s, rx * s + rz * c
+        local cd, sd = math.cos(zone.spin * ds), math.sin(zone.spin * ds)
+        local hx, hz = half.X + pad, half.Z + pad
+        local cf = zone.cf
+        local l0 = cf:PointToObjectSpace(Vector3.new(zone.px + x0, pos.Y, zone.pz + z0))
+        for _ = 1, steps do
+            local x1, z1 = x0 * cd - z0 * sd, x0 * sd + z0 * cd
+            local l1 = cf:PointToObjectSpace(Vector3.new(zone.px + x1, pos.Y, zone.pz + z1))
+            if Hazards.segBox(l0.X, l0.Z, l1.X, l1.Z, hx, hz) then return true end
+            x0, z0, l0 = x1, z1, l1
+        end
+        return false
+    end
     if zone.moving then
         local a2, b2 = math.min(a, Config.PREDICT_MAX), math.min(b, Config.PREDICT_MAX)
         local l0 = zone.cf:PointToObjectSpace(pos - zone.vel * a2)
@@ -1806,21 +2008,21 @@ function Hazards.occupies(zone, on, off, pos, t0, t1, pad)
 end
 
 -- does any zone of a windows() list occupy `pos` during [t0, t1]?
-function Hazards.hitWin(list, pos, t0, t1, pad)
+function Hazards.hitWin(list, pos, t0, t1, pad, soft)
     for _, w in ipairs(list) do
-        if Hazards.occupies(w.zone, w.on, w.off, pos, t0, t1, pad) then return true end
+        if (soft or not w.soft) and Hazards.occupies(w.zone, w.on, w.off, pos, t0, t1, pad) then return true end
     end
     return false
 end
 
 -- The first moment within `horizon` seconds at which something hits `pos` if we stand there (math.huge = nothing does).
-function Hazards.firstHitWin(list, pos, horizon, pad)
+function Hazards.firstHitWin(list, pos, horizon, pad, soft)
     local best = math.huge
     for _, w in ipairs(list) do
         local start = w.on
-        if start <= horizon and w.off >= 0 then
+        if start <= horizon and w.off >= 0 and (soft or not w.soft) then
             local z = w.zone
-            if z.kind == "orb" or z.moving then
+            if z.kind == "orb" or z.moving or z.rotating then
                 local t, last = start, math.min(w.off, horizon)
                 while t <= last do
                     if Hazards.occupies(z, w.on, w.off, pos, t, t + 0.1, pad) then
@@ -2007,6 +2209,7 @@ end
 -- =====================
 local G = Config.GRID
 local PM = Config.PREDICT_MAX
+local SPIN_STEP = Config.SPIN_STEP
 local segBox = Hazards.segBox
 
 Planner.edges = {}        -- [fromKey][toKey] = { ok, t }: walls don't move, so "can I step from here to there" is remembered
@@ -2063,6 +2266,7 @@ local function compile(wins, from, pad, horizon, reach)
     for _, w in ipairs(wins) do
         local z = w.zone
         if w.on <= horizon and w.off >= 0 then
+            local before = #out
             if z.kind == "orb" then
                 local v = z.flatVel
                 local a = flat(z.pos)
@@ -2084,17 +2288,34 @@ local function compile(wins, from, pad, horizon, reach)
                     local rl = math.sqrt(rv.X * rv.X + rv.Z * rv.Z)
                     local ll = math.sqrt(lv.X * lv.X + lv.Z * lv.Z)
                     if rl > 0.01 and ll > 0.01 then
-                        local reachBox = math.max(half.X, half.Z) * 1.5 + pad + (z.moving and flat(z.vel).Magnitude * PM or 0)
-                        if flat(cf.Position - from).Magnitude <= reach + reachBox then
-                            table.insert(out, {
-                                on = w.on, off = w.off, moving = z.moving,
-                                cx = cf.Position.X, cz = cf.Position.Z,
-                                rx = rv.X / rl, rz = rv.Z / rl, lx = lv.X / ll, lz = lv.Z / ll,
-                                hx = half.X + pad, hz = half.Z + pad, vx = z.vel.X, vz = z.vel.Z,
-                            })
+                        if z.rotating then   -- turning about (px, pz): it can reach anything within its farthest corner of the pivot
+                            local dx, dz = cf.Position.X - z.px, cf.Position.Z - z.pz
+                            local far = math.sqrt(dx * dx + dz * dz) + math.sqrt(half.X * half.X + half.Z * half.Z) + pad
+                            if flat(Vector3.new(z.px, 0, z.pz) - from).Magnitude <= reach + far then
+                                table.insert(out, {
+                                    rot = true, on = w.on, off = w.off, w = z.spin, px = z.px, pz = z.pz, rmax2 = far * far,
+                                    cx = cf.Position.X, cz = cf.Position.Z,
+                                    rx = rv.X / rl, rz = rv.Z / rl, lx = lv.X / ll, lz = lv.Z / ll,
+                                    hx = half.X + pad, hz = half.Z + pad,
+                                })
+                            end
+                        else
+                            local reachBox = math.max(half.X, half.Z) * 1.5 + pad + (z.moving and flat(z.vel).Magnitude * PM or 0)
+                            if flat(cf.Position - from).Magnitude <= reach + reachBox then
+                                table.insert(out, {
+                                    on = w.on, off = w.off, moving = z.moving,
+                                    cx = cf.Position.X, cz = cf.Position.Z,
+                                    rx = rv.X / rl, rz = rv.Z / rl, lx = lv.X / ll, lz = lv.Z / ll,
+                                    hx = half.X + pad, hz = half.Z + pad, vx = z.vel.X, vz = z.vel.Z,
+                                })
+                            end
                         end
                     end
                 end
+            end
+            if w.soft and #out > before then   -- (an attack that is over by its own account but whose part is still there)
+                out[#out].soft = true
+                out.hasSoft = true
             end
         end
     end
@@ -2102,12 +2323,12 @@ local function compile(wins, from, pad, horizon, reach)
 end
 
 -- does any compiled attack occupy (x, z) at some moment in [t0, t1]?
-local function hitAt(list, x, z, t0, t1)
+local function hitAt(list, x, z, t0, t1, soft)
     for i = 1, #list do
         local h = list[i]
         local a = t0 > h.on and t0 or h.on
         local b = t1 < h.off and t1 or h.off
-        if a <= b then
+        if a <= b and (soft or not h.soft) then
             if h.orb then
                 local sx, sz = h.ax + h.vx * a, h.az + h.vz * a
                 local ex, ez = (b - a) * h.vx, (b - a) * h.vz
@@ -2120,6 +2341,27 @@ local function hitAt(list, x, z, t0, t1)
                 end
                 local dx, dz = px - ex * u, pz - ez * u
                 if dx * dx + dz * dz <= h.r2 then return true end
+            elseif h.rot then   -- a turning beam: the spot's path through its frame is an arc about the pivot (see Hazards.occupies)
+                local rx, rz = x - h.px, z - h.pz
+                if rx * rx + rz * rz <= h.rmax2 then
+                    local a2, b2 = a < PM and a or PM, b < PM and b or PM
+                    local steps = math.ceil((b2 - a2) / SPIN_STEP)
+                    if steps < 1 then steps = 1 end
+                    local ds = (b2 - a2) / steps
+                    local th = h.w * a2
+                    local c, s = math.cos(th), math.sin(th)
+                    local x0, z0 = rx * c - rz * s, rx * s + rz * c
+                    local cd, sd = math.cos(h.w * ds), math.sin(h.w * ds)
+                    local dx0, dz0 = h.px + x0 - h.cx, h.pz + z0 - h.cz
+                    local u0, w0 = dx0 * h.rx + dz0 * h.rz, dx0 * h.lx + dz0 * h.lz
+                    for _ = 1, steps do
+                        local x1, z1 = x0 * cd - z0 * sd, x0 * sd + z0 * cd
+                        local dx1, dz1 = h.px + x1 - h.cx, h.pz + z1 - h.cz
+                        local u1, w1 = dx1 * h.rx + dz1 * h.rz, dx1 * h.lx + dz1 * h.lz
+                        if segBox(u0, w0, u1, w1, h.hx, h.hz) then return true end
+                        x0, z0, u0, w0 = x1, z1, u1, w1
+                    end
+                end
             else
                 if h.moving then   -- the spot's path through the box's own frame (see Hazards.occupies)
                     local a2, b2 = a < PM and a or PM, b < PM and b or PM
@@ -2218,13 +2460,13 @@ function Planner.strafe(opts)
         for i = 1, steps do   -- every point of the lane, at the moment we would pass it
             local f = i / steps
             local t = travel * f
-            if hitAt(list, from.X + dx * length * f, from.Z + dz * length * f, t - 0.15, t + 0.15) then
+            if hitAt(list, from.X + dx * length * f, from.Z + dz * length * f, t - 0.15, t + 0.15, true) then
                 ok = false
                 break
             end
         end
         local goal = Vector3.new(from.X + dx * length, from.Y, from.Z + dz * length)
-        if ok and hitAt(list, goal.X, goal.Z, travel, travel + hold) then ok = false end
+        if ok and hitAt(list, goal.X, goal.Z, travel, travel + hold, true) then ok = false end
         if ok then   -- the middle of the lane: no npc's body, and ground under it (a pit shorter than the lane would be missed otherwise)
             local mid = Vector3.new(from.X + dx * length * 0.5, from.Y, from.Z + dz * length * 0.5)
             if not opts.passable(mid) or not Walls.floorBelow(mid) then ok = false end
@@ -2283,7 +2525,7 @@ function Planner.plan(opts)
             local pos = node.pos
 
             -- a place to stop? it must stay safe, clear of the npcs, and suit the fight
-            if not hitAt(list, pos.X, pos.Z, node.t, node.t + settle) and Npcs.surfaceDistance(pos) >= Config.MIN_DISTANCE then
+            if not hitAt(list, pos.X, pos.Z, node.t, node.t + settle, true) and Npcs.surfaceDistance(pos) >= Config.MIN_DISTANCE then
                 local total = node.c + penalty(pos)
                 if stickPos then
                     local dx, dz = pos.X - stickPos.X, pos.Z - stickPos.Z
@@ -2314,7 +2556,9 @@ function Planner.plan(opts)
                         -- never into an npc; through an attack only at a price
                         if Npcs.surfaceDistance(npos) >= transitFloor then
                             local hit = hitAt(list, npos.X, npos.Z, tn - step / 2, tn + step / 2)
-                            local cn = node.c + (tn - node.t) + (hit and Config.HIT_COST or 0)
+                            local extra = hit and Config.HIT_COST or 0
+                            if not hit and list.hasSoft and hitAt(list, npos.X, npos.Z, tn - step / 2, tn + step / 2, true) then extra = Config.LINGER_COST end
+                            local cn = node.c + (tn - node.t) + extra
                             local old = nodes[nk]
                             if (not old or cn < old.c - 1e-6) and Planner.stepOk(node.cx, node.cz, nx, nz, pos, npos, now) then
                                 nodes[nk] = { cx = nx, cz = nz, t = tn, c = cn, h = node.h + (hit and 1 or 0), pos = npos, parent = node, vx = ux * speed, vz = uz * speed }
@@ -2596,7 +2840,7 @@ function Nav.ringPoints(group, barrier)
             local p = Vector3.new(group.centroid.X + math.cos(r) * radius, group.centroid.Y, group.centroid.Z + math.sin(r) * radius)
             local walk = flat(p - me).Magnitude / speed
             -- the point must be clear when we GET there (and for a while after), not just right now
-            if Npcs.surfaceDistance(p) >= Config.MIN_DISTANCE + 1 and not Hazards.hitWin(wins, p, walk, walk + Config.SETTLE + 1) and Walls.floorBelow(p)
+            if Npcs.surfaceDistance(p) >= Config.MIN_DISTANCE + 1 and not Hazards.hitWin(wins, p, walk, walk + Config.SETTLE + 1, nil, true) and Walls.floorBelow(p)
                 and (not insideOnly or Dungeon.within(bounds, p, -Config.BOSS_AREA_MARGIN)) then
                 table.insert(pts, { pos = p, cost = walk + Bot.pullCost(p, group) })
             end
@@ -4539,6 +4783,8 @@ end
 function Bot.logHit(amount, pos)
     local max = math.max(State.hum.MaxHealth, 1)
     if amount < math.max(1, max * 0.01) then return end
+    -- hit inside the remnant of an attack that said it was over: it was not (hard from now on, for every attack of that name)
+    Hazards.heat(pos, Hazards.windows(clock()))
     local npc, surface = Npcs.nearest(pos, Npcs.list)
     local zones = Hazards.nearNames(pos, 8)
     local parts = Hazards.partsAt(pos, 7, 8)
@@ -4560,7 +4806,7 @@ function Bot.onDamage(amount, pos)
         Hazards.pendingDeath = nil
         return
     end
-    local suspects = Hazards.blame(pos)
+    local suspects = Hazards.blame(pos, amount >= State.hum.MaxHealth * Config.HEAVY_HIT)
     local now = clock()
     if now - Bot.lastUnseen > 1 then
         Bot.lastUnseen = now
@@ -4828,7 +5074,7 @@ function Bot.approachStep(f)
         else
             -- an attack appeared over where we are heading: choose again
             local walk = flat(Nav.pathGoal - State.hrp.Position).Magnitude / f.speed
-            if Hazards.hitWin(f.wins, Nav.pathGoal, walk, walk + Config.SETTLE + 1) then needPath = true end
+            if Hazards.hitWin(f.wins, Nav.pathGoal, walk, walk + Config.SETTLE + 1, nil, true) then needPath = true end
         end
 
         if needPath then
@@ -5119,7 +5365,7 @@ function Bot.step()
     local shielded = shieldLeft > 0
     Hazards.shieldLeft = shieldLeft
     local wins = Hazards.windows(now)
-    local hitIn = Hazards.firstHitWin(wins, me, Config.HORIZON)
+    local hitIn = Hazards.firstHitWin(wins, me, Config.HORIZON, nil, true)   -- (standing in an attack's remnant counts: see Hazards.windows)
     local threatened = hitIn < math.huge
     local anyNpc, anySurface = Npcs.nearest(me, Npcs.list)
     local tooClose = shieldLeft < Config.SHIELD_TAIL and anyNpc ~= nil and anySurface < Config.MIN_DISTANCE
@@ -5261,8 +5507,15 @@ function Bot.reportText()
 
     add("--- attacks (%d) ---", (function() local k = 0 for _ in pairs(Hazards.active) do k = k + 1 end return k end)())
     for obj, zone in pairs(Hazards.active) do
-        add("%-8s %s | age %.1fs | size %.0f x %.0f", zone.kind, obj.Name, now - zone.born, zone.size.X, zone.size.Z)
+        add("%-8s %s | age %.1fs | size %.0f x %.0f%s%s", zone.kind, obj.Name, now - zone.born, zone.size.X, zone.size.Z,
+            zone.rotating and string.format(" | TURNING %.2f rad/s about (%.0f, %.0f)", zone.spin, zone.px, zone.pz) or (zone.moving and string.format(" | moving %.0f/s", flat(zone.vel).Magnitude) or ""),
+            zone.hot and " | stays dangerous after its time" or "")
     end
+    local lingering, persistent = 0, {}
+    for _ in pairs(Hazards.lingering) do lingering = lingering + 1 end
+    for key in pairs(Hazards.persistent) do table.insert(persistent, key) end
+    table.sort(persistent)
+    add("over by their own account but still there: %d%s", lingering, #persistent > 0 and ("; known to outlast their time: " .. table.concat(persistent, ", ")) or "")
     local learned = {}
     for name in pairs(Hazards.learned) do table.insert(learned, name) end
     for name in pairs(Hazards.sized) do table.insert(learned, name .. " (by size)") end
