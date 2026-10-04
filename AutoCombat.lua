@@ -26,10 +26,13 @@
                               Every attack is fired from inside its own reach (calibrated from what it hits); normal
                               npcs ignore anyone outside their aggro range, so those are fought from inside it.
 
-    Dying less:  attacks are padded more when our health is low, and when something hits us that we didn't see coming;
-                 the part that appeared right before such a hit is remembered as an attack for this run. If we DIE to
-                 something that was never registered as an attack, the part that was touching us is saved to
-                 AutoCombat/attacks.json (executor file access) and is an attack from then on, in every later run.
+    Dying less:  attacks are padded more when our health is low, and when something hits us that we didn't see coming.
+                 ANY damage (or death) from something that was never registered as an attack registers it: the new part
+                 that was touching us when it landed is an attack at once - also next to a boss, which is always close -
+                 dodged from then on, and saved to AutoCombat/attacks.json (executor file access) for every later run
+                 (after a heavy hit or a death at once; a lighter hit's part is kept for this run and saved when it hurts
+                 a second time). The telegraph that appeared on the same spot just before the blow is registered with it,
+                 so next time the dodge starts at the warning. It learns while the bot's switch is off too: you play, it learns.
                  While fighting one group, the bot stays out of the aggro range of the others.
 
     One file, a few module tables:
@@ -185,13 +188,24 @@ local Config = {
     SUSPECT_HITS        = 2,     -- a suspect that adds up to this many unseen hits is treated as an attack for the rest of this run
     SUSPECT_WEAK        = 0.34,  -- ...an unseen hit counts this much for a part that merely appeared nearby (1 for one that was touching us)
     HEAVY_HIT           = 0.4,   -- a single unseen hit that takes this share of our health: whatever was touching us is an attack at once (and saved), no second hit needed
+    LEARN_WHEN_OFF      = true,  -- the bot keeps watching attacks and learning from what hurts you while its switch is OFF (you play, it learns)
+    LEARN_ON_HIT        = true,  -- ANY unexplained hit registers what was touching us, at once (an npc standing close does not hide it): it is dodged from then on. A hit of HEAVY_HIT (or a death) saves it to the file right away; a lighter one keeps it for this run and saves it when it hurts again. false = the old way (two hits, a heavy hit, or a death)
+    EXPLAIN_MARGIN      = 1.5,   -- a live attack we know of explains a hit when we were this close to its box
+    SUSPECT_TOUCH_WINDOW = 4,    -- a part TOUCHING us when we are hurt is a culprit if it appeared this recently (the others only within SUSPECT_WINDOW)
+    LEARN_TOGETHER      = 0.8,   -- parts touching us that appeared within this long of the youngest one came with it (one attack); an older one that merely happens to be there is not blamed
+    LEARN_PER_HIT       = 3,     -- at most this many kinds of part are registered by one hit (the biggest, closest first)
+    LEARN_WARNING       = 3,     -- parts that appeared up to this long BEFORE the one that hurt us, on the same spot (its telegraph), are registered with it: next time the dodge starts at the warning
+    LEARN_MAX_SIZE      = 90,    -- a part wider than this in BOTH directions is a floor, not an attack
+    LEARN_MOVED         = 6,     -- a small part that travelled this far since it appeared is a projectile...
+    LEARN_MOVED_SIZE    = 1,     -- ...and is registered from this size up (an arrow is small)
 
     -- Learning from deaths: the part that was touching us at the unexplained hits before a death is saved as an attack.
     LEARN_PERSIST       = true,  -- keep it in a file (needs the executor's writefile / readfile); false = this run only
     LEARN_FILE          = "AutoCombat/attacks.json",
     LEARN_VERSION       = 1,
     LEARN_MAX           = 200,   -- at most this many saved attacks (the oldest go first)
-    LEARN_MARGIN        = 4,     -- "touching us" = within this many studs of the part's box
+    LEARN_MARGIN        = 3,     -- "touching us" = within this many studs of the part's box (where we are, or where we were HIT_LATENCY ago)
+    HIT_LATENCY         = 0.15,  -- a hit reaches us this long after it landed: we have run on since
     LEARN_MIN_SIZE      = 2.5,   -- smaller parts are effects, not hitboxes
     DEATH_BLAME_WINDOW  = 3,     -- an unexplained hit counts for a death this many seconds later
     OWN_EFFECT_WINDOW   = 0.8,   -- a part appearing this soon after one of our casts, next to us, may be that cast's effect
@@ -902,6 +916,7 @@ Hazards.ended = {}       -- [lifeKey .. why] = times it was logged that this kin
 Hazards.endedCount = 0
 Hazards.dormantCount = 0
 Hazards.unreliable = {}  -- [lifeKey] = true: a hit proved that this kind of attack is NOT over when it is hidden / switched off / its precast goes: only its part going away ends it
+Hazards.lastExplained = nil   -- { t, names }: the live attacks that explained the last hit (so a death right after can say what killed us)
 Hazards.livesDirty = false   -- there is something new about how long attacks last that attacks.json does not have yet
 Hazards.lastFlush = -math.huge
 Hazards.nextWake = 0
@@ -1393,7 +1408,7 @@ end
 
 function Hazards.newZone(obj, kind, initial, cf, size, isModel)
     local now = clock()
-    local key = Hazards.bareName(normalize(obj.Name))   -- what its kind of attack is called (for what is learned about it)
+    local key = Hazards.canonName(Hazards.bareName(normalize(obj.Name)))   -- what its kind of attack is called (for what is learned about it)
     return {
         obj = obj, kind = kind, isModel = isModel, initial = initial,
         -- a zone that already existed when we loaded is probably part-way through its sequence
@@ -1454,7 +1469,7 @@ function Hazards.adoptSpin(zone)
     end
 end
 
-function Hazards.add(obj, initial, fromEvent)
+function Hazards.add(obj, initial, fromEvent, bornAt)   -- `bornAt` = when it really appeared, if it has been there a while (it hurt us before we knew it)
     if Hazards.active[obj] or Hazards.skip[obj] then return end
     if Hazards.expired[obj] then
         if not fromEvent then return end   -- the polling scan must not resurrect it
@@ -1466,6 +1481,7 @@ function Hazards.add(obj, initial, fromEvent)
     if not kind then return end
 
     local zone = Hazards.newZone(obj, kind, initial, obj.CFrame, obj.Size, false)
+    if bornAt then zone.born = bornAt end
     zone.body = Hazards.inBody(obj)
     zone.model = Hazards.attackModel(obj)   -- (an attack Model inside an npc's body is one too; parts directly in the body are not)
     if zone.model then zone.lifeKey = kind .. ":" .. Hazards.bareName(normalize(zone.model.Name)) .. "/" .. zone.key end
@@ -1496,7 +1512,7 @@ end
 
 -- A Model dropped into workspace counts as an attack too (its bounding box stands in for CFrame/Size). Models that
 -- were already there when we started are scenery.
-function Hazards.addModel(model, initial)
+function Hazards.addModel(model, initial, sure, bornAt)   -- `sure` = we know it is an attack (it hurt us): the own-cast guard does not apply; `bornAt` = when it really appeared
     if not Config.MODELS_ARE_ATTACKS or initial then return end
     if Hazards.active[model] or Hazards.skip[model] or model.Parent ~= workspace then return end
     if model == workspace:FindFirstChild("dungeon") or model == workspace:FindFirstChild("map") then return end
@@ -1511,13 +1527,14 @@ function Hazards.addModel(model, initial)
 
     local ok, cf, size = pcall(function() return model:GetBoundingBox() end)
     if not ok or not cf then return end
-    if Hazards.isOurs(cf.Position) and clock() < Skills.castUntil then
+    if not sure and Hazards.isOurs(cf.Position) and clock() < Skills.castUntil then
         Hazards.skip[model] = true
         return
     end
 
     local known = Hazards.knownAttack(normalize(model.Name), size)
     local zone = Hazards.newZone(model, known and "hitbox" or "unknown", false, cf, size, true)
+    if bornAt then zone.born = bornAt end
     Hazards.active[model] = zone
     State.ignoreDirty = true
     ESP.attach(zone)
@@ -1805,8 +1822,8 @@ function Hazards.noteRecent(obj)
     local topName = (top ~= obj and top:IsA("Model") and top.Parent == workspace) and top.Name or nil
     local name = normalize(obj.Name)
     table.insert(Hazards.recent, {
-        name = name, raw = obj.Name, obj = obj, cf = obj.CFrame, size = obj.Size, pos = obj.Position,
-        t = clock(), body = inBody(obj), cls = obj.ClassName, topName = topName,
+        name = name, raw = obj.Name, obj = obj, cf = obj.CFrame, size = obj.Size, pos = obj.Position, start = obj.Position,
+        t = clock(), body = inBody(obj), cls = obj.ClassName, topName = topName, topObj = topName and top or nil,
     })
     if #Hazards.recent > 60 then table.remove(Hazards.recent, 1) end
 end
@@ -1966,42 +1983,151 @@ local function touching(r, pos, margin)
     return math.abs(l.X) <= half.X + margin and math.abs(l.Z) <= half.Z + margin and math.abs(l.Y) <= half.Y + margin + Config.VERTICAL
 end
 
--- We were hit and no zone explains it. Every part that appeared near us just before is a suspect, and one that was
--- actually touching us counts far more than one that merely appeared nearby. A suspect that adds up to SUSPECT_HITS is
--- treated as an attack for the rest of this run. Those touching us are also remembered for a few seconds: if this hit
--- turns out to be the one that kills us, they are saved (Hazards.onDeath). Returns the suspects' names (for the log).
-function Hazards.blame(pos, heavy)
-    local now = clock()
-    local order, seen = {}, {}
-    local pending = Hazards.pendingDeath
-    if not pending or now - pending.t > Config.DEATH_BLAME_WINDOW then
-        pending = { t = now, strong = {} }
-        Hazards.pendingDeath = pending
+-- Is a live attack we know of right where we were hit? (Dangerous now or within a third of a second, with a margin. Remnants are
+-- Hazards.heat's business, parts that were taken for over are Hazards.misjudged's.) Returns those zones.
+function Hazards.explains(pos, now)
+    local out = {}
+    for _, w in ipairs(Hazards.windows(now)) do
+        if not w.soft and Hazards.occupies(w.zone, w.on, w.off, pos, 0, 0.35, Config.EXPLAIN_MARGIN) then table.insert(out, w.zone) end
     end
-    pending.t = now
+    return out
+end
 
-    for _, r in ipairs(Hazards.recent) do
-        if now - r.t <= Config.SUSPECT_WINDOW and not r.body and flat(pos - r.pos).Magnitude <= Config.SUSPECT_RADIUS
-            and not Hazards.knownAttack(r.name, r.size) and not Hazards.ownEffect(r.name) then
-            local hit = touching(r, pos, Config.LEARN_MARGIN)
-            if not seen[r.name] then
-                seen[r.name] = true
-                table.insert(order, r.raw)
-                Hazards.suspects[r.name] = (Hazards.suspects[r.name] or 0) + (hit and (heavy and Config.SUSPECT_HITS or 1) or (heavy and Config.SUSPECT_WEAK * 2 or Config.SUSPECT_WEAK))
-                if Hazards.suspects[r.name] >= Config.SUSPECT_HITS then
-                    Hazards.learn(r.name, r.size, r.raw)
-                    Hazards.runLearned = Hazards.runLearned + 1
-                    Log.add("Learned attack (this run): " .. r.raw)
-                end
+-- precast / hitbox parts are attacks by their NAME: their own zones handle them (registering the name would turn a precast into a hitbox)
+function Hazards.sequenceName(name)
+    return name:find("precast", 1, true) ~= nil or name:find("hitbox", 1, true) ~= nil
+end
+
+-- A hit that a live attack explains. If that attack was only a GUESS (a loose Model nobody told us about), it hurt us: it is an
+-- attack now, known by its name. If its kind was registered tentatively (a light hit on a solid part), this second hit saves it.
+function Hazards.promote(zones)
+    if not Config.LEARN_ON_HIT then return end
+    local changed = false
+    for _, zone in ipairs(zones) do
+        local obj = zone.obj
+        if zone.kind == "unknown" and zone.isModel and obj.Parent then
+            local r = { raw = obj.Name, name = normalize(obj.Name), size = zone.size, body = false }
+            if Hazards.canRegister(r) and not Hazards.knownAttack(r.name, r.size) then
+                Hazards.register(Hazards.entryOf(r))
+                Hazards.remove(obj)
+                Hazards.addModel(obj, nil, true, zone.born)   -- (known now: a hitbox for as long as it is there, not scenery after a few seconds)
+                Log.add("Hurt by a model we only guessed at - now an attack: " .. obj.Name)
+                changed = true
             end
-            if hit and Hazards.canRegister(r) then
-                local entry = Hazards.entryOf(r)
-                pending.strong[entry.key] = entry
+        elseif not zone.isModel and (zone.kind == "hitbox" or zone.kind == "orb") then
+            local e = Hazards.entryOf({ raw = obj.Name, name = normalize(obj.Name), size = zone.size })
+            local have = Hazards.saved[e.key]
+            if have and have.tentative then
+                have.tentative, have.kills, have.t = nil, have.kills + 1, os.time()
+                Log.add("Hurt by " .. have.raw .. " again - saved")
+                changed = true
             end
         end
     end
-    Hazards.surprise = math.min(Config.SURPRISE_MAX, Hazards.surprise + Config.SURPRISE_PAD)
-    if heavy then   -- one hit that big is evidence enough: do not wait for the death
+    if changed then pcall(Hazards.writeSaved) end
+end
+
+-- We were hurt and no live attack explains it. Every part that appeared near us just before is a suspect, and one that was
+-- actually TOUCHING us counts far more than one that merely appeared nearby: the youngest of those (and what came with them) are
+-- registered as an attack at once (Hazards.register: dodged from now on, saved for later runs when the hit was heavy, else when it
+-- hurts us again), together with the telegraph that appeared on the same spot just before. An npc standing close does not hide it.
+-- A part that only appeared nearby adds up to SUSPECT_HITS unseen hits first. Those touching us are also remembered for a few
+-- seconds: if this hit turns out to be the one that kills us, they are saved (Hazards.onDeath). `melee` = an npc is in melee
+-- range: with nothing new around, that explains the hit. `vel` = how we were moving (the hit reached us a moment after it landed).
+-- Returns the suspects' names, and the kinds registered.
+function Hazards.blame(pos, heavy, melee, vel)
+    local now = clock()
+    local back = vel and (pos - Vector3.new(vel.X, 0, vel.Z) * Config.HIT_LATENCY) or pos   -- where we were when it landed
+    local order, seen = {}, {}
+    local pending = Hazards.pendingDeath
+    if not pending or now - pending.t > Config.DEATH_BLAME_WINDOW then
+        pending = { t = now, strong = {}, registered = {} }
+        Hazards.pendingDeath = pending
+    end
+    pending.t = now
+    pending.registered = pending.registered or {}
+
+    -- who could it be: new parts that were touching us, or that appeared close by a moment ago. The ones that were touching us and
+    -- are the youngest (with what came with them) are the culprits; an older one that merely happens to lie where we stand is not.
+    local cands, youngest = {}, math.huge
+    for _, r in ipairs(Hazards.recent) do
+        local age = now - r.t
+        if age <= Config.SUSPECT_TOUCH_WINDOW and not r.body and not Hazards.knownAttack(r.name, r.size) and not Hazards.ownEffect(r.name)
+            and not Hazards.sequenceName(r.name) then
+            local hit = touching(r, pos, Config.LEARN_MARGIN) or touching(r, back, Config.LEARN_MARGIN)
+            if hit or (age <= Config.SUSPECT_WINDOW and flat(pos - r.pos).Magnitude <= Config.SUSPECT_RADIUS) then
+                table.insert(cands, { r = r, age = age, hit = hit })
+                if hit then youngest = math.min(youngest, age) end
+            end
+        end
+    end
+
+    local culprits = {}   -- [what it would be saved as] = { entry, r, score, age }
+    for _, c in ipairs(cands) do
+        local r, age = c.r, c.age
+        local strong = c.hit and age <= youngest + Config.LEARN_TOGETHER and Hazards.canRegister(r)   -- (a spark that merely touched us is an effect, however hard the hit)
+        if not seen[r.name] then
+            seen[r.name] = true
+            table.insert(order, r.raw)
+            Hazards.suspects[r.name] = (Hazards.suspects[r.name] or 0) + (strong and (heavy and Config.SUSPECT_HITS or 1) or (heavy and Config.SUSPECT_WEAK * 2 or Config.SUSPECT_WEAK))
+            if Hazards.suspects[r.name] >= Config.SUSPECT_HITS and not Hazards.knownAttack(r.name, r.size) then   -- (a part that only appeared nearby, or a small one touching us: a few hits make it one)
+                Hazards.learn(r.name, r.size, r.raw)
+                Hazards.runLearned = Hazards.runLearned + 1
+                Log.add("Learned attack (this run): " .. r.raw)
+            end
+        end
+        if strong then
+            local entry = Hazards.entryOf(r)
+            pending.strong[entry.key] = entry
+            local score = math.max(r.size.X, r.size.Z) - flat(pos - r.pos).Magnitude * 0.1   -- the big one that is on top of us
+            local have = culprits[entry.key]
+            if not have or score > have.score then culprits[entry.key] = { entry = entry, r = r, score = score, age = age } end
+        end
+    end
+
+    local registered = {}
+    if Config.LEARN_ON_HIT then
+        local list = {}
+        for _, c in pairs(culprits) do table.insert(list, c) end
+        table.sort(list, function(a, b) return a.score > b.score end)
+        while #list > Config.LEARN_PER_HIT do table.remove(list) end
+        -- What warned of it: parts that appeared on the same spot a moment BEFORE the one that hurt us (a telegraph, a marker) are
+        -- registered with it - the dodge can then start at the warning, not at the blow.
+        if #list > 0 and #list < Config.LEARN_PER_HIT then
+            local lead = list[1].r
+            local taken = {}
+            for _, c in ipairs(list) do taken[c.entry.key] = true end
+            for _, r in ipairs(Hazards.recent) do
+                if #list >= Config.LEARN_PER_HIT then break end
+                if r ~= lead and r.t <= lead.t + 0.3 and lead.t - r.t <= Config.LEARN_WARNING and not r.body
+                    and not Hazards.knownAttack(r.name, r.size) and not Hazards.ownEffect(r.name) and Hazards.canRegister(r)
+                    and flat(r.pos - lead.pos).Magnitude <= math.max(math.max(r.size.X, r.size.Z), math.max(lead.size.X, lead.size.Z)) / 2 then   -- (its centre lies on the blow's footprint, or the blow's on its)
+                    local entry = Hazards.entryOf(r)
+                    if not taken[entry.key] then
+                        taken[entry.key] = true
+                        table.insert(list, { entry = entry, r = r, score = 0 })
+                    end
+                end
+            end
+        end
+        local tentative = false
+        for i = 1, #list do
+            local c = list[i]
+            Hazards.register(c.entry, not heavy)   -- (a light hit: kept for this run, saved when it hurts again)
+            tentative = tentative or not heavy
+            pending.registered[c.entry.key] = true
+            Hazards.runLearned = Hazards.runLearned + 1
+            table.insert(registered, c.entry.raw)
+            -- the part that hurt us may be there still: it is a zone now, not only the next one
+            if c.r.topObj and c.r.topObj.Parent then Hazards.addModel(c.r.topObj, nil, true, c.r.t) end
+            if c.r.obj.Parent then Hazards.add(c.r.obj, nil, true, c.r.t) end
+        end
+        if #registered > 0 then
+            Log.add("Hit by an unregistered part - now an attack: " .. table.concat(registered, ", "):sub(1, 60) ..
+                (tentative and " (kept for this run; saved if it hurts again)" or " (saved)"))
+            pcall(Hazards.writeSaved)
+        end
+    elseif heavy then   -- one hit that big is evidence enough: do not wait for the death
         local names = {}
         for _, entry in pairs(pending.strong) do
             Hazards.register(entry)
@@ -2013,7 +2139,10 @@ function Hazards.blame(pos, heavy)
             pcall(Hazards.writeSaved)
         end
     end
-    return order
+    if not melee or #order > 0 then   -- (an npc's own blows are no surprise)
+        Hazards.surprise = math.min(Config.SURPRISE_MAX, Hazards.surprise + Config.SURPRISE_PAD)
+    end
+    return order, registered
 end
 
 -- ---- learning from deaths ----
@@ -2034,6 +2163,11 @@ function Hazards.isGeneric(name)
     for _, g in ipairs(Config.GENERIC_NAMES) do
         if bare == g then return true end
     end
+    -- a GUID in the name ("a1b2c3d4e5f6") will not be the same next time: it is only known by its size
+    if #bare >= 8 then
+        local _, digits = bare:gsub("%d", "")
+        if digits / #bare >= 0.25 then return true end
+    end
     return false
 end
 
@@ -2041,7 +2175,9 @@ end
 function Hazards.knownAttack(name, size)
     if Hazards.learned[name] or Hazards.sizedMatch(name, size) then return true end
     local bare = Hazards.bareName(name)
-    return bare ~= name and (Hazards.learned[bare] or Hazards.sizedMatch(bare, size)) or false
+    if bare ~= name and (Hazards.learned[bare] or Hazards.sizedMatch(bare, size)) then return true end
+    local canon = Hazards.canonName(bare)
+    return canon ~= bare and (Hazards.learned[canon] or Hazards.sizedMatch(canon, size)) or false
 end
 
 -- is `name` at this size an attack we learned about as a generic name?
@@ -2063,8 +2199,13 @@ end
 -- may this part be saved as an attack at all?
 function Hazards.canRegister(r)
     if r.body or #r.name == 0 or #r.name > 40 or Hazards.ownEffect(r.name) then return false end
-    if Hazards.nameIgnored(r.raw) then return false end
-    return math.max(r.size.X, r.size.Z) >= Config.LEARN_MIN_SIZE
+    if Hazards.nameIgnored(r.raw) or Hazards.sequenceName(r.name) then return false end
+    local w, l = r.size.X, r.size.Z
+    if w > Config.LEARN_MAX_SIZE and l > Config.LEARN_MAX_SIZE then return false end   -- a plate as wide as the arena is the floor
+    if math.max(w, l) >= Config.LEARN_MIN_SIZE then return true end
+    -- a small part is an effect - unless it travelled: that is a projectile (and has a name of its own)
+    local moved = r.start and r.pos and flat(r.pos - r.start).Magnitude >= Config.LEARN_MOVED
+    return (moved and math.max(w, r.size.Y, l) >= Config.LEARN_MOVED_SIZE and not Hazards.isGeneric(Hazards.bareName(r.name))) or false
 end
 
 -- the name an attack is known by: its loose Model's name when it has a proper one, else the part's; trailing numbers
@@ -2074,13 +2215,18 @@ function Hazards.bareName(name)
     return #bare >= 4 and bare or name
 end
 
+-- an id inside a name ("hit839201blast") will be another one next time: the name it is known by has the number left out ("hit#blast")
+function Hazards.canonName(name)
+    return (name:gsub("%d%d%d+", "#"))
+end
+
 function Hazards.entryOf(r)
     local raw, name = r.raw, r.name
     if r.topName then
         local top = normalize(r.topName)
         if not Hazards.isGeneric(top) and top ~= "dungeon" and top ~= "map" then raw, name = r.topName, top end
     end
-    name = Hazards.bareName(name)
+    name = Hazards.canonName(Hazards.bareName(name))
     local generic = Hazards.isGeneric(name)
     local size = { math.floor(r.size.X * 10 + 0.5) / 10, math.floor(r.size.Y * 10 + 0.5) / 10, math.floor(r.size.Z * 10 + 0.5) / 10 }
     return {
@@ -2104,9 +2250,12 @@ function Hazards.canPersist()
     return Config.LEARN_PERSIST and type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
 end
 
-function Hazards.savedCount()
+-- how many attacks are saved (written to the file); `all` also counts the ones kept for this run only (tentative)
+function Hazards.savedCount(all)
     local n = 0
-    for _ in pairs(Hazards.saved) do n = n + 1 end
+    for _, e in pairs(Hazards.saved) do
+        if all or not e.tentative then n = n + 1 end
+    end
     return n
 end
 
@@ -2114,7 +2263,7 @@ function Hazards.writeSaved()
     if not Hazards.canPersist() then return end
     local list = {}
     for _, e in pairs(Hazards.saved) do
-        table.insert(list, { name = e.name, raw = e.raw, size = e.size, match = e.match, kills = e.kills, t = e.t })
+        if not e.tentative then table.insert(list, { name = e.name, raw = e.raw, size = e.size, match = e.match, kills = e.kills, t = e.t }) end
     end
     table.sort(list, function(a, b) return (a.t or 0) > (b.t or 0) end)
     while #list > Config.LEARN_MAX do table.remove(list) end
@@ -2145,22 +2294,27 @@ function Hazards.writeSaved()
     if not ok then Log.add("couldn't save attacks: " .. tostring(err):sub(1, 50)) end
 end
 
--- registers an entry as a saved attack (and counts it as one now). Returns true when it was new or reinforced.
-function Hazards.register(entry)
+-- registers an entry as a saved attack (and counts it as one now). Returns true when it was new or reinforced. `tentative` = seen
+-- once, by a light hit, on a solid part: it is dodged for the rest of this run but only written to the file when it hurts us
+-- again (or a death / heavy hit says so: the next register without `tentative`).
+function Hazards.register(entry, tentative)
     local have = Hazards.saved[entry.key]
     if have then
         have.kills, have.t = have.kills + 1, entry.t
+        if not tentative or have.kills >= 2 then have.tentative = nil end
     else
-        if Hazards.savedCount() >= Config.LEARN_MAX then
+        if Hazards.savedCount(true) >= Config.LEARN_MAX then
             local oldest, oldestKey = math.huge, nil
             for k, e in pairs(Hazards.saved) do
                 if (e.t or 0) < oldest then oldest, oldestKey = e.t or 0, k end
             end
             if oldestKey then Hazards.saved[oldestKey] = nil end
         end
+        entry.tentative = tentative or nil
         Hazards.saved[entry.key] = entry
     end
-    Hazards.learn(entry.name, Vector3.new(entry.size[1], entry.size[2], entry.size[3]), entry.raw)
+    local size = Vector3.new(entry.size[1], entry.size[2], entry.size[3])
+    if not Hazards.knownAttack(entry.name, size) then Hazards.learn(entry.name, size, entry.raw) end
     return true
 end
 
@@ -2168,13 +2322,26 @@ end
 function Hazards.onDeath()
     local d = Hazards.pendingDeath
     Hazards.pendingDeath = nil
-    if not d or clock() - d.t > Config.DEATH_BLAME_WINDOW then return end
-    local names = {}
-    for _, entry in pairs(d.strong) do
-        if Hazards.register(entry) then table.insert(names, entry.raw) end
+    local last = Hazards.lastExplained
+    if (not d or clock() - d.t > Config.DEATH_BLAME_WINDOW) and last and clock() - last.t <= 2 then
+        Log.add("Died to a known attack that was not dodged in time: " .. last.names)
+        return
     end
-    if #names > 0 then
-        Log.add("Died to something unregistered - now an attack: " .. table.concat(names, ", "):sub(1, 60))
+    if not d or clock() - d.t > Config.DEATH_BLAME_WINDOW then return end
+    local fresh, again = {}, {}
+    for key, entry in pairs(d.strong) do
+        Hazards.register(entry)   -- (a death is firm: it is saved)
+        table.insert((d.registered and d.registered[key]) and again or fresh, entry.raw)
+    end
+    table.sort(fresh)
+    table.sort(again)
+    if #fresh > 0 then
+        Log.add("Died to something unregistered - now an attack: " .. table.concat(fresh, ", "):sub(1, 60))
+    end
+    if #again > 0 then
+        Log.add("Died to " .. table.concat(again, ", "):sub(1, 50) .. " - registered when it first hurt us, saved now")
+    end
+    if #fresh + #again > 0 then
         Hazards.writeSaved()
     else
         Log.add("Died to something unseen - nothing was close enough to blame")
@@ -2196,7 +2363,7 @@ function Hazards.loadSaved()
     local n = 0
     for _, e in ipairs(data.attacks) do
         if n >= Config.LEARN_MAX then break end
-        if type(e) == "table" and type(e.name) == "string" and e.name:match("^%w+$") and #e.name <= 40 and type(e.size) == "table"
+        if type(e) == "table" and type(e.name) == "string" and e.name:match("^[%w#]+$") and #e.name <= 40 and type(e.size) == "table"
             and type(e.size[1]) == "number" and type(e.size[2]) == "number" and type(e.size[3]) == "number"
             and not Hazards.nameIgnored(e.raw or e.name) then
             local entry = {
@@ -2251,11 +2418,20 @@ end
 -- a name that was learned (or saved) by mistake: it is not an attack
 function Hazards.unlearn(name)
     local bare = Hazards.bareName(name)
+    local canon = Hazards.canonName(bare)
     Hazards.learned[name], Hazards.learned[bare], Hazards.sized[name], Hazards.sized[bare] = nil, nil, nil, nil
+    Hazards.learned[canon], Hazards.sized[canon] = nil, nil
     local changed = false
     for key, e in pairs(Hazards.saved) do
-        if e.name == name or e.name == bare then
+        if e.name == name or e.name == bare or e.name == canon then
             Hazards.saved[key] = nil
+            changed = true
+        end
+    end
+    for key in pairs(Hazards.lives) do   -- (what was learned about how long it lasts goes with it)
+        if key:match(":" .. canon .. "$") or key:match("/" .. canon .. "$") then
+            Hazards.lives[key] = nil
+            Hazards.livesCount = math.max(0, Hazards.livesCount - 1)
             changed = true
         end
     end
@@ -5142,7 +5318,7 @@ function UI.update()
         r.threat.Text = col(UI.C.green, "clear")
         setBar(r.threatBar, 0, UI.C.green)
     end
-    r.learned.Text = string.format("%d saved  /  %d this run", Hazards.savedCount(), Hazards.runLearned)
+    r.learned.Text = string.format("%d saved  /  %d this run", Hazards.savedCount(), Hazards.runLearned)   -- (saved = in the file)
     local pad = Hazards.extraPad
     if pad > 0.05 then r.threat.Text = r.threat.Text .. col(UI.C.dim, string.format("  (+%.1f caution)", pad)) end
     if Hazards.shieldLeft > 0 then
@@ -5273,13 +5449,20 @@ function Bot.logHit(amount, pos)
     while #Bot.hits > Config.HIT_LOG do table.remove(Bot.hits, 1) end
 end
 
--- Something hurt us. If the attacks we know about don't explain it (none near us, no npc within reach), it was something
--- we didn't see coming: pad every attack more for a while, and remember what appeared just before as suspects.
+-- Something hurt us. If a live attack we know of was right there, that explains it. Otherwise it was something we did not see
+-- coming: whatever new part was touching us is registered as an attack at once (an npc standing close does not hide it), every
+-- attack is padded more for a while, and the parts that appeared just before are remembered as suspects.
 function Bot.onDamage(amount, pos)
     if amount < math.max(3, State.hum.MaxHealth * 0.03) then return end
-    -- an attack we know of was right there / an npc in melee range: that explains it (and it isn't what to learn from)
-    if Hazards.nearby(pos, 4) > 0 or Npcs.surfaceDistance(pos) < Config.MIN_DISTANCE + 4 then
+    local now = clock()
+    local explained = Hazards.explains(pos, now)
+    if #explained > 0 then
         Hazards.pendingDeath = nil
+        local names = {}
+        for _, zone in ipairs(explained) do table.insert(names, zone.kind .. " " .. zone.obj.Name) end
+        table.sort(names)
+        Hazards.lastExplained = { t = now, names = table.concat(names, ", "):sub(1, 80) }
+        Hazards.promote(explained)   -- (a guessed Model that hurt us is an attack; a tentative one that hurts twice is saved)
         return
     end
     -- the part of an attack we had just taken for over (hidden / switched off / its precast gone) was touching us: it was not over
@@ -5287,8 +5470,14 @@ function Bot.onDamage(amount, pos)
         Hazards.pendingDeath = nil
         return
     end
-    local suspects = Hazards.blame(pos, amount >= State.hum.MaxHealth * Config.HEAVY_HIT)
-    local now = clock()
+    local melee = Npcs.surfaceDistance(pos) < Config.MIN_DISTANCE + 4
+    local suspects, registered = Hazards.blame(pos, amount >= State.hum.MaxHealth * Config.HEAVY_HIT, melee, State.hrp.AssemblyLinearVelocity)
+    local last = Bot.hits[#Bot.hits]   -- (the hit log, for the report, says what this hit taught)
+    if last and not last.death and #registered > 0 then last.registered = table.concat(registered, ", ") end
+    if melee and #suspects == 0 then   -- an npc in melee range with nothing new around: its own blow
+        Hazards.pendingDeath = nil
+        return
+    end
     if now - Bot.lastUnseen > 1 then
         Bot.lastUnseen = now
         Log.add(string.format("Hit by something unseen (-%.0f)%s", amount, #suspects > 0 and (": " .. table.concat(suspects, ", "):sub(1, 60)) or ""))
@@ -5325,7 +5514,7 @@ function Bot.onCharacter(char, initial)
 
         local lastHealth = hum.Health
         hum.HealthChanged:Connect(function(health)
-            if health < lastHealth and State.enabled and clock() >= State.shieldUntil then
+            if health < lastHealth and (State.enabled or Config.LEARN_WHEN_OFF) and clock() >= State.shieldUntil then
                 pcall(Bot.logHit, lastHealth - health, root.Position)
                 pcall(Bot.onDamage, lastHealth - health, root.Position)
             end
@@ -5809,6 +5998,11 @@ function Bot.step()
     Bot.lastStep = now
     Walls.refresh(now)
     if not State.enabled then
+        if Config.LEARN_WHEN_OFF then   -- (you play, the bot learns: attacks are tracked and what hurts you is registered, bot or no bot)
+            Hazards.update(now)
+            Hazards.scan(now)
+            Npcs.refresh(0.5)
+        end
         Bot.idle(now)
         return
     end
@@ -6027,6 +6221,10 @@ function Bot.reportText()
     for name in pairs(Hazards.sized) do table.insert(learned, name .. " (by size)") end
     if #learned > 0 then add("learned attacks: %s", table.concat(learned, ", ")) end
     add("saved attacks: %d (%s)", Hazards.savedCount(), Hazards.canPersist() and Config.LEARN_FILE or "no file access - this run only")
+    local registeredList = {}
+    for _, e in pairs(Hazards.saved) do table.insert(registeredList, string.format("%s x%d%s", e.raw, e.kills, e.tentative and " (this run only)" or "")) end
+    table.sort(registeredList)
+    if #registeredList > 0 then add("    registered by hits and deaths: %s", table.concat(registeredList, ", "):sub(1, 500)) end
 
     -- every hit, and what was around: "UNSEEN" ones are attacks the bot does not know
     add("--- hits taken: %d (oldest first) ---", #Bot.hits)
@@ -6036,9 +6234,10 @@ function Bot.reportText()
         else
             local parts = {}
             for _, p in ipairs(h.parts) do table.insert(parts, describePart(p)) end
-            add("%7.1fs  -%.0f%% (%.0f%% left) [%s] while %s | npc %s%s | known attacks within 8 studs: %s | parts within 7 studs: %s", h.t, h.frac * 100, h.left * 100,
+            add("%7.1fs  -%.0f%% (%.0f%% left) [%s] while %s | npc %s%s | known attacks within 8 studs: %s | parts within 7 studs: %s%s", h.t, h.frac * 100, h.left * 100,
                 h.why, h.mode, h.npc or "-", h.npcDist and string.format(" %.0f studs", h.npcDist) or "",
-                #h.zones > 0 and table.concat(h.zones, ", ") or "none", #parts > 0 and table.concat(parts, ", ") or "none")
+                #h.zones > 0 and table.concat(h.zones, ", ") or "none", #parts > 0 and table.concat(parts, ", ") or "none",
+                h.registered and (" | REGISTERED as an attack: " .. h.registered) or "")
         end
     end
 
